@@ -32,6 +32,7 @@ from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db, store_jobs, get_stats
 from applypilot.llm import get_client
+from applypilot.llm_errors import LLMError
 
 log = logging.getLogger(__name__)
 
@@ -359,7 +360,7 @@ or
 No explanation, no markdown, no thinking."""
 
 
-def judge_api_responses(api_responses: list[dict]) -> list[dict]:
+def judge_api_responses(api_responses: list[dict], request_scope: str | None = None) -> list[dict]:
     """Use the LLM to filter API responses, keeping only job-relevant ones."""
     if not api_responses:
         return []
@@ -393,7 +394,11 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
         )
 
         try:
-            raw = client.ask(prompt, temperature=0.0, max_tokens=1024)
+            raw = client.ask(
+                prompt,
+                request_key=request_scope or f"discovery-judge:{resp.get('url', '')}",
+                request_label=f"discovery API response review for {resp.get('url', 'site')[:100]}",
+            )
             verdict = extract_json(raw)
             is_relevant = verdict.get("relevant", False)
             reason = verdict.get("reason", "?")
@@ -401,6 +406,8 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
                      "KEEP" if is_relevant else "DROP", reason)
             if is_relevant:
                 relevant.append(resp)
+        except LLMError:
+            raise
         except Exception as e:
             log.warning("Judge ERROR for %s: %s -- keeping", resp.get("url", "?")[:80], e)
             relevant.append(resp)
@@ -638,11 +645,11 @@ PAGE HTML:
 
 # -- LLM helpers -------------------------------------------------------------
 
-def ask_llm(prompt: str) -> tuple[str, float, dict]:
+def ask_llm(prompt: str, request_key: str | None = None, request_label: str = "site discovery") -> tuple[str, float, dict]:
     """Send prompt to LLM. Returns (response_text, seconds_taken, metadata)."""
     client = get_client()
     t0 = time.time()
-    text = client.ask(prompt, temperature=0.0, max_tokens=4096)
+    text = client.ask(prompt, request_key=request_key, request_label=request_label)
     elapsed = time.time() - t0
     meta = {
         "finish_reason": "stop",
@@ -780,7 +787,7 @@ def execute_api_response(intel: dict, plan: dict) -> list[dict]:
     return jobs
 
 
-def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
+def execute_css_selectors(intel: dict, request_key: str | None = None) -> tuple[dict, list[dict]]:
     """Phase 2: Send full cleaned page HTML to LLM for card detection + selector generation.
     Returns (selectors, jobs)."""
     full_html = intel.get("full_html", "")
@@ -794,7 +801,13 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     prompt = FULL_PAGE_SELECTOR_PROMPT.format(page_html=cleaned)
 
     try:
-        raw, elapsed, meta = ask_llm(prompt)
+        raw, elapsed, meta = ask_llm(
+            prompt,
+            request_key=request_key,
+            request_label=f"selector extraction for {intel.get('url', 'site')}",
+        )
+    except LLMError:
+        raise
     except Exception as e:
         log.error("LLM_ERROR in Phase 2: %s", e)
         return {}, []
@@ -804,7 +817,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     try:
         selectors = extract_json(raw)
     except Exception as e:
-        log.error("PARSE_ERROR in Phase 2: %s | raw: %s", e, raw[:500])
+        log.error("PARSE_ERROR in Phase 2: %s", e)
         return {}, []
 
     if "error" in selectors:
@@ -879,7 +892,9 @@ def _run_one_site(name: str, url: str) -> dict:
     # Step 1.5: Judge filters API responses
     if intel["api_responses"]:
         log.info("[1.5] Judge filtering API responses...")
-        intel["api_responses"] = judge_api_responses(intel["api_responses"])
+        intel["api_responses"] = judge_api_responses(
+            intel["api_responses"], request_scope=f"discovery:{url}"
+        )
         log.info("Kept %d relevant responses", len(intel["api_responses"]))
 
     # Step 2: Strategy selection
@@ -888,7 +903,13 @@ def _run_one_site(name: str, url: str) -> dict:
 
     prompt = STRATEGY_PROMPT.format(briefing=briefing)
     try:
-        raw, elapsed, meta = ask_llm(prompt)
+        raw, elapsed, meta = ask_llm(
+            prompt,
+            request_key=f"discovery:{url}",
+            request_label=f"site strategy selection for {url}",
+        )
+    except LLMError:
+        raise
     except Exception as e:
         log.error("LLM_ERROR: %s", e)
         return {"name": name, "status": "LLM_ERROR", "error": str(e)}
@@ -898,8 +919,8 @@ def _run_one_site(name: str, url: str) -> dict:
     try:
         plan = extract_json(raw)
     except Exception as e:
-        log.error("PARSE_ERROR: %s | raw: %s", e, raw[:500])
-        return {"name": name, "status": "PARSE_ERROR", "error": str(e), "raw": raw}
+        log.error("PARSE_ERROR: %s", e)
+        return {"name": name, "status": "PARSE_ERROR", "error": str(e)}
 
     strategy = plan.get("strategy", "?")
     reasoning = plan.get("reasoning", "?")
@@ -916,11 +937,16 @@ def _run_one_site(name: str, url: str) -> dict:
             jobs = execute_api_response(intel, plan)
         elif strategy == "css_selectors":
             log.info("-> Phase 2: Generating selectors from card examples...")
-            selectors, jobs = execute_css_selectors(intel)
+            selectors, jobs = execute_css_selectors(
+                intel,
+                request_key=f"discovery:{url}",
+            )
             plan["extraction"] = selectors
         else:
             log.warning("Unknown strategy: %s", strategy)
             jobs = []
+    except LLMError:
+        raise
     except Exception as e:
         log.error("EXECUTION_ERROR: %s", e)
         return {"name": name, "status": "EXEC_ERROR", "error": str(e), "plan": plan}
@@ -1045,6 +1071,7 @@ def _run_all(
 
     if workers > 1 and len(targets) > 1:
         # Parallel mode
+        llm_failure: LLMError | None = None
         with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as pool:
             future_to_target = {
                 pool.submit(_run_one_site, target["name"], target["url"]): target
@@ -1052,9 +1079,17 @@ def _run_all(
             }
             for future in as_completed(future_to_target):
                 target = future_to_target[future]
-                r = future.result()
+                try:
+                    r = future.result()
+                except LLMError as exc:
+                    # Drain the pool and persist every site that completed so
+                    # a provider failure does not discard successful results.
+                    llm_failure = llm_failure or exc
+                    continue
                 results.append(r)
                 _process_result(r, target)
+        if llm_failure:
+            raise llm_failure
     else:
         # Sequential mode (default)
         for i, target in enumerate(targets):

@@ -4,7 +4,7 @@ Interactive flow that creates ~/.applypilot/ with:
   - resume.txt (and optionally resume.pdf)
   - profile.json
   - searches.yaml
-  - .env (LLM API key)
+  - .env (optional runtime settings such as CapSolver)
 """
 
 from __future__ import annotations
@@ -234,46 +234,62 @@ def _setup_searches() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
-    """Ask about AI scoring/tailoring — optional LLM configuration."""
+    """Connect ChatGPT plan usage for scoring, tailoring, and cover letters."""
     console.print(Panel(
         "[bold]Step 4: AI Features (optional)[/bold]\n"
-        "An LLM powers job scoring, resume tailoring, and cover letters.\n"
-        "Without this, you can still discover and enrich jobs."
+        "ChatGPT powers job scoring, resume tailoring, and cover letters.\n"
+        "ApplyPilot sends your resume, profile details, and job descriptions to OpenAI for these stages. "
+        "Inference uses your eligible ChatGPT plan authorization, not API-key billing. "
+        "Plan usage is shared with other apps using the same ChatGPT account and follows its usage limits."
     ))
 
     if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
-        console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
+        console.print("[dim]Discovery-only mode. Connect ChatGPT later with [bold]applypilot auth login[/bold].[/dim]")
         return
 
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
-    provider = Prompt.ask(
-        "Provider",
-        choices=["gemini", "openai", "local"],
-        default="gemini",
-    )
+    from applypilot.llm_errors import ChatGPTAuthError
+    from applypilot.siwc import ChatGPTAuth
 
-    env_lines = ["# ApplyPilot configuration", ""]
+    auth = ChatGPTAuth()
+    accounts = auth.accounts()
+    selected_id = None
+    new_account = not accounts
+    if len(accounts) == 1:
+        selected_id = accounts[0]["client_id"]
+    elif accounts:
+        choices = [account["client_id"] for account in accounts] + ["new"]
+        active_id = auth.active_client_id()
+        default = active_id if active_id in choices else "new"
+        selected = Prompt.ask(
+            "Use a saved ChatGPT registration or add one",
+            choices=choices,
+            default=default,
+        )
+        new_account = selected == "new"
+        if not new_account:
+            selected_id = selected
 
-    if provider == "gemini":
-        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
-        model = Prompt.ask("Model", default="gemini-2.0-flash")
-        env_lines.append(f"GEMINI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "openai":
-        api_key = Prompt.ask("OpenAI API key")
-        model = Prompt.ask("Model", default="gpt-4o-mini")
-        env_lines.append(f"OPENAI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "local":
-        url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")
-        model = Prompt.ask("Model name", default="local-model")
-        env_lines.append(f"LLM_URL={url}")
-        env_lines.append(f"LLM_MODEL={model}")
+    try:
+        account = auth.login(client_id=selected_id, new_account=new_account)
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]ChatGPT sign-in failed:[/red] {exc}")
+        console.print("[dim]You can retry later with `applypilot auth login`.[/dim]")
+        return
 
-    env_lines.append("")
-    ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
-    console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
-
+    if auth.is_plan_enabled(account):
+        console.print(
+            f"[green]ChatGPT plan connected[/green] ({account.get('email') or 'account email unavailable'})."
+        )
+        try:
+            models = auth.list_models(account["client_id"])
+            console.print(f"[green]Available ChatGPT models:[/green] {len(models)}")
+        except ChatGPTAuthError as exc:
+            console.print(f"[yellow]Model discovery failed; check later with `applypilot auth models`:[/yellow] {exc}")
+    else:
+        console.print(
+            "[yellow]ChatGPT sign-in completed, but it did not grant subscription-backed inference. "
+            "Run `applypilot auth login --account <client-id>` and approve ChatGPT plan access.[/yellow]"
+        )
 
 # ---------------------------------------------------------------------------
 # Auto-Apply
@@ -378,7 +394,7 @@ def run_wizard() -> None:
 
     unlock_hint = ""
     if tier == 1:
-        unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 2: connect a ChatGPT account with [bold]applypilot auth login[/bold].[/dim]"
     elif tier == 2:
         unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
 

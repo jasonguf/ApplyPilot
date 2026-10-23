@@ -29,7 +29,14 @@ Three commands. That's it.
 ```bash
 pip install applypilot
 pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
-applypilot init          # one-time setup: resume, profile, preferences, API keys
+applypilot init          # one-time setup: resume, profile, preferences, ChatGPT sign-in
+applypilot auth login    # connect or reauthorize a ChatGPT account
+applypilot auth accounts # list saved registrations
+applypilot auth status   # show the active session and model
+applypilot auth models   # list models visible to that account
+applypilot auth use-model <slug>
+applypilot auth test     # send one small connection-check request
+applypilot auth pending  # review requests with an uncertain outcome
 applypilot doctor        # verify your setup — shows what's installed and what's missing
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
@@ -45,12 +52,12 @@ applypilot apply --dry-run  # fill forms without submitting
 ## Two Paths
 
 ### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
+**Requires:** Python 3.11+, Node.js (for npx), an eligible ChatGPT account, Claude Code CLI, Chrome
 
 Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
 
 ### Discovery + Tailoring Only
-**Requires:** Python 3.11+, Gemini API key (free)
+**Requires:** Python 3.11+, an eligible ChatGPT account
 
 Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cover letters. You submit applications manually with the AI-prepared materials.
 
@@ -90,11 +97,11 @@ Each stage is independent. Run them all or pick what you need.
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
-| Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
+| ChatGPT plan sign-in | Scoring, tailoring, cover letters | Uses eligible subscription-backed Responses access |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
 | Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
 
-**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
+ApplyPilot uses **Sign in with ChatGPT** for its LLM stages. It does not use an OpenAI API key, Gemini key, or local-model endpoint, and it does not silently fall back to another billing route. ChatGPT plan usage is subject to the selected account's eligibility and usage limits. Plus usage is shared with other apps using the same plan. See [OpenAI's SIWC guide](https://developers.openai.com/siwc/token-sharing-open-source) and [plan usage settings](https://chatgpt.com/#settings/usage).
 
 ### Optional
 
@@ -117,7 +124,13 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
+Optional runtime settings such as `CAPSOLVER_API_KEY`, `APPLYPILOT_LLM_MAX_CALLS`, and `APPLYPILOT_LLM_CONCURRENCY`. ChatGPT access tokens are stored in the operating-system credential store, not in `.env`. The legacy `GEMINI_API_KEY`, `OPENAI_API_KEY`, `LLM_URL`, and `LLM_MODEL` settings are ignored.
+
+Inspect available models with `applypilot auth models` and save a selection with `applypilot auth use-model <slug>`. The default is the first model visible to the active account. `APPLYPILOT_LLM_MAX_CALLS` sets an optional local request ceiling per ApplyPilot process (`0` means no local ceiling). `APPLYPILOT_LLM_CONCURRENCY` caps simultaneous model requests (default `2`). These settings do not estimate ChatGPT's remaining usage.
+
+ApplyPilot sends resume text, profile details, and job descriptions to OpenAI when an AI stage needs them. OAuth tokens are stored only in supported OS credential stores (Windows Credential Locker, macOS Keychain, Freedesktop Secret Service, or KDE Wallet); ApplyPilot refuses plaintext and unverified keyring backends. On Linux, the credential service must be installed and unlocked. Each direct Responses request uses `store: false` and streaming as required by the current SIWC preview. AI requests stop on authorization or plan-usage errors; partial or interrupted responses are discarded and are not automatically resent. If a stream ends without a terminal event, ApplyPilot records an uncertain request locally. Review it with `applypilot auth pending`; `applypilot auth retry-unknown <request-id>` requires confirmation before allowing a later run to resend it.
+
+This subscription-backed route handles text inference for discovery, enrichment, scoring, resume tailoring, and cover letters. It does not provide browser control or MCP tools. Auto-apply still uses the existing Claude Code and Playwright MCP launcher; migrating that browser agent is a separate implementation step. Direct Responses requests use text inputs and `instructions`; unsupported generation parameters are not sent.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -168,7 +181,7 @@ applypilot run --workers 4              # Parallel discovery/enrichment
 applypilot run --stream                 # Concurrent stages (streaming mode)
 applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
-applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
+applypilot run --validation lenient     # Relax validation and skip the LLM judge (fewer requests)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
 applypilot apply                        # Launch auto-apply
 applypilot apply --workers 3            # Parallel browser workers

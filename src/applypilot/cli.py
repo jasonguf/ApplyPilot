@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
+from datetime import datetime
 from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from applypilot import __version__
@@ -22,6 +25,8 @@ app = typer.Typer(
     help="AI-powered end-to-end job application pipeline.",
     no_args_is_help=True,
 )
+auth_app = typer.Typer(name="auth", help="Manage ChatGPT plan sign-in and models.", no_args_is_help=True)
+app.add_typer(auth_app, name="auth")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -73,6 +78,317 @@ def init() -> None:
     run_wizard()
 
 
+@auth_app.command("login")
+def auth_login(
+    account: str | None = typer.Option(None, "--account", help="Reauthorize a saved issued client ID."),
+    new_account: bool = typer.Option(False, "--new-account", help="Register another ChatGPT account/workspace."),
+) -> None:
+    """Connect or reauthorize a ChatGPT account for subscription-backed AI."""
+    from applypilot.llm_errors import ChatGPTAuthError
+    from applypilot.siwc import ChatGPTAuth
+
+    if not Confirm.ask(
+        "ApplyPilot will send your resume, profile details, and job descriptions to OpenAI for AI stages. "
+        "ChatGPT plan usage is shared with other apps on the account and subject to its limits. Continue?",
+        default=True,
+    ):
+        raise typer.Exit()
+
+    auth = ChatGPTAuth()
+    try:
+        accounts = auth.accounts()
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not read saved ChatGPT accounts:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    selected_id = account
+    add_account = new_account
+    if selected_id and new_account:
+        console.print("[red]Choose either --account or --new-account.[/red]")
+        raise typer.Exit(code=2)
+    if not selected_id and not add_account:
+        if len(accounts) == 1:
+            selected_id = accounts[0]["client_id"]
+        elif len(accounts) > 1:
+            choices = [item["client_id"] for item in accounts] + ["new"]
+            try:
+                active_id = auth.active_client_id()
+            except ChatGPTAuthError as exc:
+                console.print(f"[red]Could not read the active ChatGPT account:[/red] {exc}")
+                raise typer.Exit(code=1) from exc
+            default = active_id if active_id in choices else "new"
+            choice = Prompt.ask("Choose a saved registration or add one", choices=choices, default=default)
+            add_account = choice == "new"
+            if not add_account:
+                selected_id = choice
+
+    try:
+        saved = auth.login(client_id=selected_id, new_account=add_account)
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]ChatGPT sign-in failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if auth.is_plan_enabled(saved):
+        console.print(f"[green]Connected:[/green] {saved.get('email') or 'ChatGPT account'}")
+        try:
+            models = auth.list_models(saved["client_id"])
+            console.print(f"[green]Available models:[/green] {len(models)}. Run `applypilot auth models` to view them.")
+        except ChatGPTAuthError as exc:
+            console.print(f"[yellow]Sign-in saved, but model discovery failed:[/yellow] {exc}")
+    else:
+        console.print(
+            "[yellow]Sign-in saved, but ChatGPT did not grant plan inference permission. "
+            "Run `applypilot auth login --account <client-id>` and approve the requested plan scope.[/yellow]"
+        )
+
+
+@auth_app.command("accounts")
+def auth_accounts() -> None:
+    """List saved ChatGPT registrations without displaying credentials."""
+    from applypilot.siwc import ChatGPTAuth
+
+    auth = ChatGPTAuth()
+    try:
+        accounts = auth.accounts()
+        active_id = auth.active_client_id()
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not read saved ChatGPT accounts:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if not accounts:
+        console.print("No ChatGPT registrations saved. Run `applypilot auth login`.")
+        return
+    table = Table(title="ChatGPT Registrations", show_header=True, header_style="bold cyan")
+    table.add_column("Active")
+    table.add_column("Account")
+    table.add_column("Issued client ID")
+    table.add_column("Plan access")
+    for item in accounts:
+        table.add_row(
+            "*" if item.get("client_id") == active_id else "",
+            item.get("email") or "Email unavailable",
+            item["client_id"],
+            "enabled" if auth.is_plan_enabled(item) else "needs sign-in/permission",
+        )
+    console.print(table)
+
+
+@auth_app.command("status")
+def auth_status() -> None:
+    """Show the active ChatGPT account and local session status."""
+    from applypilot.llm_errors import ChatGPTAuthError
+    from applypilot.siwc import ChatGPTAuth, USAGE_SETTINGS_URL
+
+    auth = ChatGPTAuth()
+    try:
+        account = auth.active_account()
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not read the local ChatGPT account:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if not account:
+        console.print("[yellow]No ChatGPT account connected.[/yellow] Run `applypilot auth login`.")
+        return
+    expires_at = account.get("expires_at", 0)
+    if account.get("refresh_state") in {"in_progress", "unknown"}:
+        expires_text = "refresh outcome unconfirmed; sign in again"
+    else:
+        expires_text = (
+            datetime.fromtimestamp(expires_at).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+            if expires_at else "needs sign-in"
+        )
+    try:
+        state = "enabled" if auth.has_active_account() else "not enabled or needs sign-in"
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not inspect the local ChatGPT session:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Account:      {account.get('email') or 'Email unavailable'}")
+    console.print(f"Plan access:  {state}")
+    console.print(f"Session:      {expires_text}")
+    console.print(f"Model:        {account.get('selected_model') or 'first model visible to this account'}")
+    console.print(f"Usage:        {USAGE_SETTINGS_URL}")
+
+
+@auth_app.command("pending")
+def auth_pending() -> None:
+    """Show requests whose outcome was not confirmed."""
+    from applypilot.llm_errors import LLMError
+    from applypilot.llm_outcomes import pending
+
+    try:
+        outcomes = pending()
+    except LLMError as exc:
+        console.print(f"[red]Could not read request outcomes:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if not outcomes:
+        console.print("No uncertain or in-flight LLM requests.")
+        return
+    table = Table(title="Requests Requiring Review", header_style="bold yellow")
+    table.add_column("Request ID")
+    table.add_column("State")
+    table.add_column("Stage/item")
+    table.add_column("Recorded")
+    for outcome in outcomes:
+        table.add_row(
+            outcome["id"],
+            outcome.get("state", "unknown"),
+            outcome.get("label", "LLM request"),
+            outcome.get("updated_at") or outcome.get("created_at", ""),
+        )
+    console.print(table)
+    console.print(
+        "ApplyPilot will not resend these requests until you explicitly release a guard with "
+        "`applypilot auth retry-unknown <request-id>`."
+    )
+
+
+@auth_app.command("retry-unknown")
+def auth_retry_unknown(request_id: str = typer.Argument(..., help="Full or unique prefix shown by `auth pending`.")) -> None:
+    """Explicitly release one uncertain-request guard so a future run may retry it."""
+    from applypilot.llm_errors import LLMError
+    from applypilot.llm_outcomes import pending, release
+
+    try:
+        outcomes = pending()
+        matches = [item for item in outcomes if item["id"] == request_id or item["id"].startswith(request_id)]
+    except LLMError as exc:
+        console.print(f"[red]Could not read request outcomes:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if len(matches) != 1:
+        console.print("[red]Request ID was unmatched or ambiguous.[/red] Run `applypilot auth pending`.")
+        raise typer.Exit(code=1)
+    match = matches[0]
+    if not Confirm.ask(
+        f"The prior {match.get('label', 'LLM')} request may already have completed. "
+        "Clear the guard so a later pipeline run may send it again and use plan capacity?",
+        default=False,
+    ):
+        raise typer.Exit()
+    try:
+        released = release(match["id"])
+    except LLMError as exc:
+        console.print(f"[red]Could not release request guard:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[yellow]Released guard {released['id']}.[/yellow] The matching stage may resend this request "
+        "the next time you run it."
+    )
+
+
+@auth_app.command("models")
+def auth_models() -> None:
+    """List models visible to the active ChatGPT account."""
+    from applypilot.llm_errors import ChatGPTAuthError
+    from applypilot.siwc import ChatGPTAuth
+
+    auth = ChatGPTAuth()
+    try:
+        account = auth.active_account()
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not read the active ChatGPT account:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if not account:
+        console.print("[yellow]No ChatGPT account connected.[/yellow] Run `applypilot auth login`.")
+        raise typer.Exit(code=1)
+    try:
+        models = auth.list_models(account["client_id"])
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not load models:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    selected = account.get("selected_model")
+    table = Table(title="Models Visible to the Active ChatGPT Account", header_style="bold cyan")
+    table.add_column("Selected")
+    table.add_column("Model slug")
+    table.add_column("Name")
+    for model in models:
+        table.add_row("*" if model["slug"] == selected else "", model["slug"], model["display_name"])
+    console.print(table)
+    console.print("Select one with `applypilot auth use-model <slug>`. Model access can vary by account.")
+
+
+@auth_app.command("use-account")
+def auth_use_account(account: str = typer.Argument(..., help="Full issued client ID or unique account email.")) -> None:
+    """Select the active ChatGPT registration."""
+    from applypilot.llm_errors import ChatGPTAuthError
+    from applypilot.siwc import ChatGPTAuth
+
+    try:
+        selected = ChatGPTAuth().select_account(account)
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not select account:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Active ChatGPT account:[/green] {selected.get('email') or selected['client_id']}")
+
+
+@auth_app.command("use-model")
+def auth_use_model(model: str = typer.Argument(..., help="Visible model slug from `applypilot auth models`.")) -> None:
+    """Save a model selection for the active ChatGPT account."""
+    from applypilot.llm_errors import ChatGPTAuthError
+    from applypilot.siwc import ChatGPTAuth
+
+    try:
+        selected = ChatGPTAuth().select_model(model)
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not select model:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Selected model:[/green] {selected['display_name']} ({selected['slug']})")
+
+
+@auth_app.command("test")
+def auth_test() -> None:
+    """Send one small request through the selected ChatGPT plan route."""
+    from applypilot.llm import get_client
+    from applypilot.llm_errors import LLMError
+
+    try:
+        client = get_client()
+        response = client.ask(
+            "Say exactly: ApplyPilot ChatGPT connection is working.",
+            request_key="auth-test",
+            request_label="ChatGPT connection self-test",
+        )
+    except LLMError as exc:
+        console.print(f"[red]ChatGPT request failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Completed with {client.model}:[/green] {response}")
+    console.print(f"Requests this process: {client.request_count}")
+
+
+@auth_app.command("logout")
+def auth_logout(
+    account: str | None = typer.Option(None, "--account", help="Issued client ID to disconnect."),
+    all_accounts: bool = typer.Option(False, "--all", help="Disconnect every saved registration."),
+) -> None:
+    """Revoke and remove the selected ChatGPT registration."""
+    from applypilot.llm_errors import ChatGPTAuthError
+    from applypilot.siwc import ChatGPTAuth
+
+    auth = ChatGPTAuth()
+    try:
+        targets = [item["client_id"] for item in auth.accounts()] if all_accounts else [account]
+        if not all_accounts and not account:
+            targets = [auth.active_client_id()]
+    except ChatGPTAuthError as exc:
+        console.print(f"[red]Could not read saved ChatGPT accounts:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    targets = [item for item in targets if item]
+    if not targets:
+        console.print("No saved ChatGPT registrations to disconnect.")
+        return
+    if not Confirm.ask(f"Disconnect {len(targets)} ChatGPT registration(s)?", default=False):
+        raise typer.Exit()
+    for client_id in targets:
+        try:
+            revoked, revoke_error = auth.logout(client_id)
+        except ChatGPTAuthError as exc:
+            console.print(f"[red]Could not remove {client_id}:[/red] {exc}")
+            continue
+        if revoked:
+            console.print(f"[green]Disconnected and revoked:[/green] {client_id}")
+        else:
+            console.print(
+                f"[yellow]Removed locally:[/yellow] {client_id}. Remote revocation was not confirmed. "
+                f"Disconnect it in ChatGPT Settings if needed. {revoke_error or ''}"
+            )
+
+
 @app.command()
 def run(
     stages: Optional[list[str]] = typer.Argument(
@@ -93,7 +409,7 @@ def run(
         help=(
             "Validation strictness for tailor/cover stages. "
             "strict: banned words = errors, judge must pass. "
-            "normal: banned words = warnings only (default, recommended for Gemini free tier). "
+            "normal: banned words = warnings only (default). "
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
@@ -379,21 +695,21 @@ def doctor() -> None:
                         "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex"))
 
     # --- Tier 2 checks ---
-    import os
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
-        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
-    else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+    from applypilot.siwc import ChatGPTAuth
+    try:
+        chatgpt_account = ChatGPTAuth().active_account()
+        auth = ChatGPTAuth()
+        if chatgpt_account and auth.has_active_account():
+            model = chatgpt_account.get("selected_model") or "account default"
+            results.append(("ChatGPT plan", ok_mark, f"{chatgpt_account.get('email') or 'Connected'} ({model})"))
+        elif chatgpt_account:
+            results.append(("ChatGPT plan", fail_mark,
+                            "Plan permission or secure session unavailable — run 'applypilot auth login'"))
+        else:
+            results.append(("ChatGPT plan", fail_mark,
+                            "Connect your ChatGPT account — run 'applypilot auth login'"))
+    except Exception as exc:
+        results.append(("ChatGPT plan", fail_mark, f"Account settings unavailable: {exc}"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI
@@ -445,7 +761,7 @@ def doctor() -> None:
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
     if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
+        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (run 'applypilot auth login')[/dim]")
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
     elif tier == 2:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")

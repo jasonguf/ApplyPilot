@@ -68,9 +68,9 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     Schema columns by stage:
       - Discovery:  url, title, salary, description, location, site, strategy, discovered_at
       - Enrichment: full_description, application_url, detail_scraped_at, detail_error
-      - Scoring:    fit_score, score_reasoning, scored_at
-      - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
-      - Cover:      cover_letter_path, cover_letter_at, cover_attempts
+      - Scoring:    fit_score, score_reasoning, scored_at, model/prompt/input provenance
+      - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts, provenance
+      - Cover:      cover_letter_path, cover_letter_at, cover_attempts, provenance
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
                    agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
                    verification_confidence
@@ -109,16 +109,25 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             fit_score             INTEGER,
             score_reasoning       TEXT,
             scored_at             TEXT,
+            score_model           TEXT,
+            score_prompt_version  TEXT,
+            score_input_hash      TEXT,
 
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
             tailored_at           TEXT,
             tailor_attempts       INTEGER DEFAULT 0,
+            tailored_model        TEXT,
+            tailored_prompt_version TEXT,
+            tailored_input_hash  TEXT,
 
             -- Cover letter stage
             cover_letter_path     TEXT,
             cover_letter_at       TEXT,
             cover_attempts        INTEGER DEFAULT 0,
+            cover_letter_model    TEXT,
+            cover_prompt_version  TEXT,
+            cover_input_hash      TEXT,
 
             -- Application stage
             applied_at            TEXT,
@@ -162,14 +171,23 @@ _ALL_COLUMNS: dict[str, str] = {
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
     "scored_at": "TEXT",
+    "score_model": "TEXT",
+    "score_prompt_version": "TEXT",
+    "score_input_hash": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
     "tailor_attempts": "INTEGER DEFAULT 0",
+    "tailored_model": "TEXT",
+    "tailored_prompt_version": "TEXT",
+    "tailored_input_hash": "TEXT",
     # Cover letter
     "cover_letter_path": "TEXT",
     "cover_letter_at": "TEXT",
     "cover_attempts": "INTEGER DEFAULT 0",
+    "cover_letter_model": "TEXT",
+    "cover_prompt_version": "TEXT",
+    "cover_input_hash": "TEXT",
     # Application
     "applied_at": "TEXT",
     "apply_status": "TEXT",

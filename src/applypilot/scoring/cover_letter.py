@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.llm_errors import LLMError
+from applypilot.provenance import input_fingerprint
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     LLM_LEAK_PHRASES,
@@ -24,6 +26,29 @@ from applypilot.scoring.validator import (
 log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+COVER_PROMPT_VERSION = "cover-v1"
+
+
+def _cover_input_hash(
+    resume_text: str,
+    job: dict,
+    profile: dict,
+    model: str,
+    validation_mode: str,
+) -> str:
+    return input_fingerprint({
+        "prompt_version": COVER_PROMPT_VERSION,
+        "model": model,
+        "validation_mode": validation_mode,
+        "resume": resume_text,
+        "profile": profile,
+        "job": {
+            "title": job.get("title"),
+            "site": job.get("site"),
+            "location": job.get("location"),
+            "full_description": job.get("full_description"),
+        },
+    })
 
 
 # ── Prompt Builder (profile-driven) ──────────────────────────────────────
@@ -165,7 +190,11 @@ def generate_cover_letter(
             )},
         ]
 
-        letter = client.chat(messages, max_tokens=1024, temperature=0.7)
+        letter = client.chat(
+            messages,
+            request_key=f"cover:{job.get('url', '')}",
+            request_label=f"cover letter for {job.get('title', 'unknown job')}",
+        )
         letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
         letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
 
@@ -200,6 +229,26 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
+    client = get_client()
+
+    saved = conn.execute(
+        "SELECT * FROM jobs WHERE cover_letter_path IS NOT NULL AND cover_input_hash IS NOT NULL"
+    ).fetchall()
+    stale_urls = []
+    for row in saved:
+        job = dict(row)
+        if job["cover_input_hash"] != _cover_input_hash(
+            resume_text, job, profile, client.model, validation_mode
+        ):
+            stale_urls.append(job["url"])
+    if stale_urls:
+        conn.executemany(
+            "UPDATE jobs SET cover_letter_path=NULL, cover_letter_at=NULL, cover_letter_model=NULL, "
+            "cover_prompt_version=NULL, cover_input_hash=NULL, cover_attempts=0 WHERE url=?",
+            [(url,) for url in stale_urls],
+        )
+        conn.commit()
+        log.info("Marked %d cover letters stale after their inputs or model changed.", len(stale_urls))
 
     # Fetch jobs that have tailored resumes but no cover letter yet
     jobs = conn.execute(
@@ -236,11 +285,14 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         try:
             letter = generate_cover_letter(resume_text, job, profile,
                                           validation_mode=validation_mode)
+            input_hash = _cover_input_hash(
+                resume_text, job, profile, client.model, validation_mode
+            )
 
             # Build safe filename prefix
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
             safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            prefix = f"{safe_site}_{safe_title}_{input_fingerprint(job['url'])[:8]}"
 
             cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
             cl_path.write_text(letter, encoding="utf-8")
@@ -259,8 +311,22 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
                 "pdf_path": pdf_path,
                 "title": job["title"],
                 "site": job["site"],
+                "model": client.model,
+                "prompt_version": COVER_PROMPT_VERSION,
+                "input_hash": input_hash,
             }
             results.append(result)
+
+            conn.execute(
+                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, cover_letter_model=?, "
+                "cover_prompt_version=?, cover_input_hash=?, "
+                "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
+                (
+                    str(cl_path), datetime.now(timezone.utc).isoformat(), client.model,
+                    COVER_PROMPT_VERSION, input_hash, job["url"],
+                ),
+            )
+            conn.commit()
 
             elapsed = time.time() - t0
             rate = completed / elapsed if elapsed > 0 else 0
@@ -268,6 +334,8 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
                 "%d/%d [OK] | %.1f jobs/min | %s",
                 completed, len(jobs), rate * 60, result["title"][:40],
             )
+        except LLMError:
+            raise
         except Exception as e:
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
@@ -276,24 +344,13 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             error_count += 1
             results.append(result)
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
-
-    # Persist to DB: increment attempt counter for ALL, save path only for successes
-    now = datetime.now(timezone.utc).isoformat()
-    saved = 0
-    for r in results:
-        if r.get("path"):
-            conn.execute(
-                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
-                "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-            saved += 1
-        else:
             conn.execute(
                 "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["url"],),
+                (job["url"],),
             )
-    conn.commit()
+            conn.commit()
+
+    saved = sum(1 for result in results if result.get("path"))
 
     elapsed = time.time() - t0
     log.info("Cover letters done in %.1fs: %d generated, %d errors", elapsed, saved, error_count)

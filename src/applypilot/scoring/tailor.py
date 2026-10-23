@@ -19,6 +19,8 @@ from pathlib import Path
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.llm_errors import LLMError
+from applypilot.provenance import input_fingerprint
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     FABRICATION_WATCHLIST,
@@ -28,8 +30,31 @@ from applypilot.scoring.validator import (
 )
 
 log = logging.getLogger(__name__)
+TAILOR_PROMPT_VERSION = "tailor-v1"
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+
+
+def _tailor_input_hash(
+    resume_text: str,
+    job: dict,
+    profile: dict,
+    model: str,
+    validation_mode: str,
+) -> str:
+    return input_fingerprint({
+        "prompt_version": TAILOR_PROMPT_VERSION,
+        "model": model,
+        "validation_mode": validation_mode,
+        "resume": resume_text,
+        "profile": profile,
+        "job": {
+            "title": job.get("title"),
+            "site": job.get("site"),
+            "location": job.get("location"),
+            "full_description": job.get("full_description"),
+        },
+    })
 
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
@@ -300,7 +325,11 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 # ── LLM Judge ────────────────────────────────────────────────────────────
 
 def judge_tailored_resume(
-    original_text: str, tailored_text: str, job_title: str, profile: dict
+    original_text: str,
+    tailored_text: str,
+    job_title: str,
+    profile: dict,
+    request_key: str | None = None,
 ) -> dict:
     """LLM judge layer: catches subtle fabrication that programmatic checks miss.
 
@@ -326,7 +355,11 @@ def judge_tailored_resume(
     ]
 
     client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.1)
+    response = client.chat(
+        messages,
+        request_key=request_key,
+        request_label=f"resume validation for {job_title}",
+    )
 
     passed = "VERDICT: PASS" in response.upper()
     issues = "none"
@@ -400,7 +433,12 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        request_key = f"tailor:{job.get('url', '')}"
+        raw = client.chat(
+            messages,
+            request_key=request_key,
+            request_label=f"resume tailoring for {job.get('title', 'unknown job')}",
+        )
 
         # Parse JSON from response
         try:
@@ -432,7 +470,13 @@ def tailor_resume(
             report["status"] = "approved"
             return tailored, report
 
-        judge = judge_tailored_resume(resume_text, tailored, job.get("title", ""), profile)
+        judge = judge_tailored_resume(
+            resume_text,
+            tailored,
+            job.get("title", ""),
+            profile,
+            request_key=f"tailor:{job.get('url', '')}",
+        )
         report["judge"] = judge
 
         if not judge["passed"]:
@@ -470,6 +514,28 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
+    client = get_client()
+
+    saved = conn.execute(
+        "SELECT * FROM jobs WHERE tailored_resume_path IS NOT NULL AND tailored_input_hash IS NOT NULL"
+    ).fetchall()
+    stale_urls = []
+    for row in saved:
+        job = dict(row)
+        if job["tailored_input_hash"] != _tailor_input_hash(
+            resume_text, job, profile, client.model, validation_mode
+        ):
+            stale_urls.append(job["url"])
+    if stale_urls:
+        conn.executemany(
+            "UPDATE jobs SET tailored_resume_path=NULL, tailored_at=NULL, tailored_model=NULL, "
+            "tailored_prompt_version=NULL, tailored_input_hash=NULL, cover_letter_path=NULL, "
+            "cover_letter_at=NULL, cover_letter_model=NULL, cover_prompt_version=NULL, "
+            "cover_input_hash=NULL, cover_attempts=0 WHERE url=?",
+            [(url,) for url in stale_urls],
+        )
+        conn.commit()
+        log.info("Marked %d tailored resumes and cover letters stale after input/model changes.", len(stale_urls))
 
     jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
 
@@ -489,11 +555,19 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode)
+            input_hash = _tailor_input_hash(
+                resume_text, job, profile, client.model, validation_mode
+            )
+            report.update({
+                "model": client.model,
+                "prompt_version": TAILOR_PROMPT_VERSION,
+                "input_fingerprint": input_hash,
+            })
 
             # Build safe filename prefix
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
             safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            prefix = f"{safe_site}_{safe_title}_{input_fingerprint(job['url'])[:8]}"
 
             # Save tailored resume text
             txt_path = TAILORED_DIR / f"{prefix}.txt"
@@ -533,7 +607,12 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "site": job["site"],
                 "status": report["status"],
                 "attempts": report["attempts"],
+                "model": client.model,
+                "prompt_version": TAILOR_PROMPT_VERSION,
+                "input_hash": input_hash,
             }
+        except LLMError:
+            raise
         except Exception as e:
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
@@ -543,6 +622,24 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
 
         results.append(result)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
+
+        now = datetime.now(timezone.utc).isoformat()
+        if result["status"] in {"approved", "approved_with_judge_warning"}:
+            conn.execute(
+                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, tailored_model=?, "
+                "tailored_prompt_version=?, tailored_input_hash=?, "
+                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (
+                    result["path"], now, result["model"], result["prompt_version"],
+                    result["input_hash"], result["url"],
+                ),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["url"],),
+            )
+        conn.commit()
 
         elapsed = time.time() - t0
         rate = completed / elapsed if elapsed > 0 else 0
@@ -554,23 +651,6 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             rate * 60,
             result["title"][:40],
         )
-
-    # Persist to DB: increment attempt counter for ALL, save path only for approved
-    now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
-    for r in results:
-        if r["status"] in _success_statuses:
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info(

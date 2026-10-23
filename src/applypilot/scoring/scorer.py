@@ -14,8 +14,11 @@ from datetime import datetime, timezone
 from applypilot.config import RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.llm_errors import LLMOutputError
+from applypilot.provenance import input_fingerprint
 
 log = logging.getLogger(__name__)
+SCORE_PROMPT_VERSION = "score-v1"
 
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
@@ -50,7 +53,7 @@ def _parse_score_response(response: str) -> dict:
     Returns:
         {"score": int, "keywords": str, "reasoning": str}
     """
-    score = 0
+    score = None
     keywords = ""
     reasoning = response
 
@@ -59,15 +62,32 @@ def _parse_score_response(response: str) -> dict:
         if line.startswith("SCORE:"):
             try:
                 score = int(re.search(r"\d+", line).group())
-                score = max(1, min(10, score))
+                if not 1 <= score <= 10:
+                    raise ValueError("score must be from 1 to 10")
             except (AttributeError, ValueError):
-                score = 0
+                score = None
         elif line.startswith("KEYWORDS:"):
             keywords = line.replace("KEYWORDS:", "").strip()
         elif line.startswith("REASONING:"):
             reasoning = line.replace("REASONING:", "").strip()
 
+    if score is None:
+        raise LLMOutputError("ChatGPT returned a completed scoring response without a valid 1–10 score.")
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
+
+
+def _score_input_hash(resume_text: str, job: dict, model: str) -> str:
+    return input_fingerprint({
+        "prompt_version": SCORE_PROMPT_VERSION,
+        "model": model,
+        "resume": resume_text,
+        "job": {
+            "title": job.get("title"),
+            "site": job.get("site"),
+            "location": job.get("location"),
+            "full_description": job.get("full_description"),
+        },
+    })
 
 
 def score_job(resume_text: str, job: dict) -> dict:
@@ -92,13 +112,19 @@ def score_job(resume_text: str, job: dict) -> dict:
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
-    try:
-        client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
-        return _parse_score_response(response)
-    except Exception as e:
-        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+    client = get_client()
+    response = client.chat(
+        messages,
+        request_key=f"score:{job.get('url', '')}",
+        request_label=f"job score for {job.get('title', 'unknown job')}",
+    )
+    result = _parse_score_response(response)
+    result.update({
+        "model": client.model,
+        "prompt_version": SCORE_PROMPT_VERSION,
+        "input_hash": _score_input_hash(resume_text, job, client.model),
+    })
+    return result
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
@@ -113,6 +139,27 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
+
+    client = get_client()
+
+    # Invalidate only outputs that have provenance. Older results without a
+    # fingerprint are kept intact because their inputs cannot be reconstructed.
+    saved = conn.execute(
+        "SELECT * FROM jobs WHERE fit_score IS NOT NULL AND score_input_hash IS NOT NULL"
+    ).fetchall()
+    stale_urls = []
+    for row in saved:
+        job = dict(row)
+        if job["score_input_hash"] != _score_input_hash(resume_text, job, client.model):
+            stale_urls.append(job["url"])
+    if stale_urls:
+        conn.executemany(
+            "UPDATE jobs SET fit_score=NULL, score_reasoning=NULL, scored_at=NULL, "
+            "score_model=NULL, score_prompt_version=NULL, score_input_hash=NULL WHERE url=?",
+            [(url,) for url in stale_urls],
+        )
+        conn.commit()
+        log.info("Marked %d saved scores stale after their inputs or model changed.", len(stale_urls))
 
     if rescore:
         query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
@@ -134,35 +181,31 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     log.info("Scoring %d jobs sequentially...", len(jobs))
     t0 = time.time()
     completed = 0
-    errors = 0
-    results: list[dict] = []
 
     for job in jobs:
         result = score_job(resume_text, job)
-        result["url"] = job["url"]
         completed += 1
-
-        if result["score"] == 0:
-            errors += 1
-
-        results.append(result)
-
+        conn.execute(
+            "UPDATE jobs SET fit_score=?, score_reasoning=?, scored_at=?, score_model=?, "
+            "score_prompt_version=?, score_input_hash=? WHERE url=?",
+            (
+                result["score"],
+                f"{result['keywords']}\n{result['reasoning']}",
+                datetime.now(timezone.utc).isoformat(),
+                result["model"],
+                result["prompt_version"],
+                result["input_hash"],
+                job["url"],
+            ),
+        )
+        conn.commit()
         log.info(
             "[%d/%d] score=%d  %s",
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
 
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
-
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", completed, elapsed, completed / elapsed if elapsed > 0 else 0)
 
     # Score distribution
     dist = conn.execute("""
@@ -173,8 +216,8 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     distribution = [(row[0], row[1]) for row in dist]
 
     return {
-        "scored": len(results),
-        "errors": errors,
+        "scored": completed,
+        "errors": 0,
         "elapsed": elapsed,
         "distribution": distribution,
     }

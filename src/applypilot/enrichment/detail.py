@@ -26,6 +26,7 @@ from applypilot import config
 from applypilot.config import DB_PATH
 from applypilot.database import get_connection, init_db, ensure_columns
 from applypilot.llm import get_client
+from applypilot.llm_errors import LLMError
 
 log = logging.getLogger(__name__)
 
@@ -465,7 +466,11 @@ def extract_with_llm(page, url: str) -> dict:
     try:
         client = get_client()
         t0 = time.time()
-        raw = client.ask(prompt, temperature=0.0, max_tokens=4096)
+        raw = client.ask(
+            prompt,
+            request_key=f"detail:{url}",
+            request_label=f"job detail extraction for {title or url}",
+        )
         elapsed = time.time() - t0
         log.info("LLM: %d chars in, %.1fs", len(prompt), elapsed)
 
@@ -478,6 +483,8 @@ def extract_with_llm(page, url: str) -> dict:
             desc = clean_description(desc)
 
         return {"full_description": desc, "application_url": apply_url}
+    except LLMError:
+        raise
     except Exception as e:
         log.error("LLM ERROR: %s", e)
         return {"full_description": None, "application_url": None}
@@ -837,6 +844,8 @@ def stream_detail(
                         total_err += stats["error"]
                         log.info("%s: %d ok, %d partial, %d error",
                                  site, stats['ok'], stats['partial'], stats['error'])
+                    except LLMError:
+                        raise
                     except Exception as e:
                         log.error("%s: CRASHED: %s", site, e)
 

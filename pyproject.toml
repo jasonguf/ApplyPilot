@@ -26,7 +26,11 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "pandas>=2.0",
-    ]
+    "keyring>=25.0,<27",
+    "secretstorage>=3.2; sys_platform == 'linux'",
+    "PyJWT[crypto]>=2.8,<3",
+    "filelock>=3.12,<4",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.1"]

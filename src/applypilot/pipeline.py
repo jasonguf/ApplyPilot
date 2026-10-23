@@ -23,6 +23,8 @@ from rich.table import Table
 
 from applypilot.config import load_env, ensure_dirs
 from applypilot.database import init_db, get_connection, get_stats
+from applypilot.llm_errors import LLMError
+from applypilot.llm import trip_circuit
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -91,6 +93,8 @@ def _run_discover(workers: int = 1) -> dict:
         from applypilot.discovery.smartextract import run_smart_extract
         run_smart_extract(workers=workers)
         stats["smartextract"] = "ok"
+    except LLMError:
+        raise
     except Exception as e:
         log.error("Smart extract failed: %s", e)
         console.print(f"  [red]Smart extract error:[/red] {e}")
@@ -105,6 +109,8 @@ def _run_enrich(workers: int = 1) -> dict:
         from applypilot.enrichment.detail import run_enrichment
         run_enrichment(workers=workers)
         return {"status": "ok"}
+    except LLMError:
+        raise
     except Exception as e:
         log.error("Enrichment failed: %s", e)
         return {"status": f"error: {e}"}
@@ -116,6 +122,8 @@ def _run_score() -> dict:
         from applypilot.scoring.scorer import run_scoring
         run_scoring()
         return {"status": "ok"}
+    except LLMError:
+        raise
     except Exception as e:
         log.error("Scoring failed: %s", e)
         return {"status": f"error: {e}"}
@@ -127,6 +135,8 @@ def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
         from applypilot.scoring.tailor import run_tailoring
         run_tailoring(min_score=min_score, validation_mode=validation_mode)
         return {"status": "ok"}
+    except LLMError:
+        raise
     except Exception as e:
         log.error("Tailoring failed: %s", e)
         return {"status": f"error: {e}"}
@@ -138,6 +148,8 @@ def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
         from applypilot.scoring.cover_letter import run_cover_letters
         run_cover_letters(min_score=min_score, validation_mode=validation_mode)
         return {"status": "ok"}
+    except LLMError:
+        raise
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
         return {"status": f"error: {e}"}
@@ -284,6 +296,11 @@ def _run_stage_streaming(
         try:
             result = runner(**kwargs)
             tracker.mark_done(stage, result)
+        except LLMError as e:
+            log.error("LLM stage '%s' stopped: %s", stage, e)
+            trip_circuit(e)
+            stop_event.set()
+            tracker.mark_done(stage, {"status": f"error: {e}"})
         except Exception as e:
             log.exception("Stage '%s' crashed", stage)
             tracker.mark_done(stage, {"status": f"error: {e}"})
@@ -303,6 +320,12 @@ def _run_stage_streaming(
             try:
                 runner(**kwargs)
                 passes += 1
+            except LLMError as e:
+                log.error("LLM stage '%s' stopped (pass %d): %s", stage, passes, e)
+                trip_circuit(e)
+                stop_event.set()
+                tracker.mark_done(stage, {"status": f"error: {e}", "passes": passes})
+                return
             except Exception as e:
                 log.error("Stage '%s' error (pass %d): %s", stage, passes, e)
                 passes += 1
@@ -316,7 +339,8 @@ def _run_stage_streaming(
             if stop_event.wait(timeout=_STREAM_POLL_INTERVAL):
                 break  # Stop requested
 
-    tracker.mark_done(stage, {"status": "ok", "passes": passes})
+    final_status = "skipped: pipeline stop requested" if stop_event.is_set() else "ok"
+    tracker.mark_done(stage, {"status": final_status, "passes": passes})
 
 
 # ---------------------------------------------------------------------------
@@ -329,8 +353,9 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
     results: list[dict] = []
     errors: dict[str, str] = {}
     pipeline_start = time.time()
+    llm_failed = False
 
-    for name in ordered:
+    for index, name in enumerate(ordered):
         meta = STAGE_META[name]
         console.print(f"\n{'=' * 70}")
         console.print(f"  [bold]STAGE: {name}[/bold] — {meta['desc']}")
@@ -366,12 +391,22 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
             status = f"error: {e}"
             log.exception("Stage '%s' crashed", name)
             console.print(f"\n  [red]STAGE FAILED:[/red] {e}")
+            llm_failed = isinstance(e, LLMError)
+            if llm_failed:
+                trip_circuit(e)
 
         results.append({"stage": name, "status": status, "elapsed": elapsed})
         if status not in ("ok", "partial"):
             errors[name] = status
 
         console.print(f"\n  Stage '{name}' completed in {elapsed:.1f}s — {status}")
+
+        if llm_failed:
+            for skipped in ordered[index + 1:]:
+                skipped_status = "skipped: stopped after LLM failure"
+                results.append({"stage": skipped, "status": skipped_status, "elapsed": 0.0})
+                errors[skipped] = skipped_status
+            break
 
     total_elapsed = time.time() - pipeline_start
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
@@ -435,7 +470,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         status = r.get("status", "ok")
 
         results.append({"stage": name, "status": status, "elapsed": elapsed})
-        if status not in ("ok", "partial", "skipped"):
+        if status not in ("ok", "partial", "skipped") and not status.startswith("skipped:"):
             errors[name] = status
 
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
@@ -524,6 +559,15 @@ def run_pipeline(
     summary.add_row("", "", "")
     summary.add_row("[bold]Total[/bold]", "", f"[bold]{result['elapsed']:.1f}s[/bold]")
     console.print(summary)
+
+    from applypilot.llm import usage_stats
+    usage = usage_stats()
+    if usage:
+        limit = usage["max_calls"] or "unlimited"
+        console.print(
+            f"\n  ChatGPT requests this run: {usage['requests']} / {limit} "
+            f"(model: {usage['model']}). Check plan usage in ChatGPT Settings."
+        )
 
     # Final DB stats
     final = get_stats()
