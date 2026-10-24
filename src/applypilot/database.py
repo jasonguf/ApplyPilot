@@ -10,7 +10,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import DB_PATH
+from applypilot.config import DB_PATH, DEFAULTS
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -87,6 +87,33 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     conn = get_connection(path)
+    existing_jobs = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone()
+    if existing_jobs:
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        missing_columns = set(_ALL_COLUMNS) - existing_columns
+        attempt_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='apply_attempts'"
+        ).fetchone()
+        existing_attempt_columns = (
+            {row[1] for row in conn.execute("PRAGMA table_info(apply_attempts)").fetchall()}
+            if attempt_table else set()
+        )
+        missing_attempt_columns = (
+            {"verification_evidence", "model", "account_fingerprint", "profile_sha256", "dry_run"}
+            - existing_attempt_columns
+            if attempt_table else set()
+        )
+        if (missing_columns or missing_attempt_columns) and str(path) != ":memory:":
+            # Preserve the previous database before any forward migration.
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            backup_path = Path(f"{path}.{stamp}.bak")
+            backup = sqlite3.connect(str(backup_path))
+            try:
+                conn.backup(backup)
+            finally:
+                backup.close()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             -- Discovery stage (smart_extract / job_search)
@@ -95,9 +122,14 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             salary                TEXT,
             description           TEXT,
             location              TEXT,
+            company               TEXT,
+            requisition_id        TEXT,
             site                  TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
+            posted_at             TEXT,
+            employment_type       TEXT,
+            remote_type           TEXT,
 
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
@@ -138,7 +170,28 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             last_attempted_at     TEXT,
             apply_duration_ms     INTEGER,
             apply_task_id         TEXT,
-            verification_confidence TEXT
+            verification_confidence TEXT,
+            apply_phase            TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS apply_attempts (
+            id              TEXT PRIMARY KEY,
+            run_id          TEXT NOT NULL,
+            job_url         TEXT NOT NULL,
+            resume_mode     TEXT NOT NULL,
+            resume_sha256   TEXT NOT NULL,
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT,
+            outcome         TEXT,
+            error           TEXT,
+            resolved_at     TEXT,
+            resolution      TEXT,
+            verification_evidence TEXT,
+            model           TEXT,
+            account_fingerprint TEXT,
+            profile_sha256  TEXT,
+            dry_run         INTEGER NOT NULL DEFAULT 0
         )
     """)
     conn.commit()
@@ -159,9 +212,14 @@ _ALL_COLUMNS: dict[str, str] = {
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
+    "company": "TEXT",
+    "requisition_id": "TEXT",
     "site": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
+    "posted_at": "TEXT",
+    "employment_type": "TEXT",
+    "remote_type": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
@@ -198,6 +256,9 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    "apply_resume_mode": "TEXT",
+    "apply_resume_sha256": "TEXT",
+    "apply_phase": "TEXT",
 }
 
 
@@ -231,6 +292,23 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {dtype}")
             added.append(col)
 
+    if added:
+        conn.commit()
+
+    attempt_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(apply_attempts)").fetchall()
+    }
+    attempt_migrations = {
+        "verification_evidence": "TEXT",
+        "model": "TEXT",
+        "account_fingerprint": "TEXT",
+        "profile_sha256": "TEXT",
+        "dry_run": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for col, dtype in attempt_migrations.items():
+        if col not in attempt_columns:
+            conn.execute(f"ALTER TABLE apply_attempts ADD COLUMN {col} {dtype}")
+            added.append(f"apply_attempts.{col}")
     if added:
         conn.commit()
 
@@ -331,7 +409,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     ).fetchone()[0]
 
     stats["apply_errors"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'failed'"
     ).fetchone()[0]
 
     stats["ready_to_apply"] = conn.execute(
@@ -339,6 +417,29 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "WHERE tailored_resume_path IS NOT NULL "
         "AND applied_at IS NULL "
         "AND application_url IS NOT NULL"
+    ).fetchone()[0]
+
+    max_attempts = DEFAULTS["max_apply_attempts"]
+    stats["ready_to_apply_tailored"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        "AND applied_at IS NULL AND application_url IS NOT NULL "
+        "AND fit_score >= ? AND (apply_status IS NULL OR apply_status = 'failed') "
+        "AND COALESCE(apply_attempts, 0) < ?", (DEFAULTS["min_score"], max_attempts)
+    ).fetchone()[0]
+    stats["ready_to_apply_base"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE applied_at IS NULL "
+        "AND COALESCE(application_url, url) <> '' "
+        "AND (apply_status IS NULL OR apply_status = 'failed') "
+        "AND COALESCE(apply_attempts, 0) < ?", (max_attempts,)
+    ).fetchone()[0]
+    stats["needs_review"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'needs_review'"
+    ).fetchone()[0]
+    stats["uncertain"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'uncertain'"
+    ).fetchone()[0]
+    stats["awaiting_user"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'awaiting_user'"
     ).fetchone()[0]
 
     return stats

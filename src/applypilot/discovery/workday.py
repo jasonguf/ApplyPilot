@@ -20,6 +20,7 @@ from html.parser import HTMLParser
 import yaml
 
 from applypilot import config
+from applypilot.apply.identity import extract_requisition_id
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db
 
@@ -320,21 +321,35 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
         full_description = description if len(description) > 200 else None
         detail_scraped_at = now if full_description else None
         detail_error = job.get("detail_error")
+        raw_posted = str(job.get("posted") or "")
+        posted_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", raw_posted)
+        posted_at = posted_match.group(1) if posted_match else None
 
         site = job.get("employer_name", "Corporate")
+        requisition_id = extract_requisition_id(job.get("job_id"), job.get("requisition_id"), url)
         strategy = "workday_api"
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
-                "discovered_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, company, requisition_id, site, strategy, "
+                "discovered_at, full_description, application_url, detail_scraped_at, detail_error, "
+                "posted_at, employment_type, remote_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), None, short_desc, job.get("location"),
-                 site, strategy, now, full_description, url, detail_scraped_at, detail_error),
+                 site, requisition_id, site, strategy, now, full_description, url, detail_scraped_at, detail_error,
+                 posted_at, job.get("time_type"), job.get("remote_type")),
             )
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+            conn.execute(
+                "UPDATE jobs SET company = COALESCE(company, ?), "
+                "requisition_id = COALESCE(requisition_id, ?), "
+                "posted_at = COALESCE(posted_at, ?), "
+                "employment_type = COALESCE(employment_type, ?), remote_type = COALESCE(remote_type, ?) "
+                "WHERE url = ?",
+                (site, requisition_id, posted_at, job.get("time_type"), job.get("remote_type"), url),
+            )
 
     conn.commit()
     return new, existing

@@ -8,6 +8,7 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 from jobspy import scrape_jobs
 
 from applypilot import config
+from applypilot.apply.identity import clean_identifier, extract_requisition_id
 from applypilot.database import get_connection, init_db, store_jobs
 
 log = logging.getLogger(__name__)
@@ -155,6 +157,12 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             location_str = f"{location_str} (Remote)" if location_str else "Remote"
 
         strategy = "jobspy"
+        raw_posted = row.get("date_posted")
+        posted_text = str(raw_posted) if raw_posted is not None else ""
+        posted_at = posted_text[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", posted_text) else None
+        job_type = row.get("job_type")
+        employment_type = str(job_type) if job_type is not None and str(job_type).casefold() not in {"nan", "nat", "none"} else None
+        remote_type = "remote" if is_remote is True or str(is_remote).casefold() in {"true", "1", "yes"} else None
 
         # If JobSpy gave us a full description, promote it directly
         full_description = None
@@ -165,18 +173,36 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        requisition_id = extract_requisition_id(
+            row.get("job_id"), row.get("id"), url, apply_url,
+        )
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
+                "INSERT INTO jobs (url, title, salary, description, location, company, requisition_id, site, strategy, discovered_at, "
+                "full_description, application_url, detail_scraped_at, posted_at, employment_type, remote_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, salary, description, location_str, clean_identifier(company), requisition_id,
+                 site_label, strategy, now,
+                 full_description, apply_url, detail_scraped_at, posted_at, employment_type, remote_type),
             )
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+            conn.execute(
+                "UPDATE jobs SET company = COALESCE(company, ?), "
+                "requisition_id = COALESCE(requisition_id, ?), "
+                "posted_at = COALESCE(posted_at, ?), "
+                "employment_type = COALESCE(employment_type, ?), remote_type = COALESCE(remote_type, ?) "
+                "WHERE url = ?",
+                (clean_identifier(company), requisition_id, posted_at, employment_type, remote_type, url),
+            )
+            conn.execute(
+                "UPDATE jobs SET posted_at = COALESCE(posted_at, ?), "
+                "employment_type = COALESCE(employment_type, ?), remote_type = COALESCE(remote_type, ?) "
+                "WHERE url = ?",
+                (posted_at, employment_type, remote_type, url),
+            )
 
     conn.commit()
     return new, existing
