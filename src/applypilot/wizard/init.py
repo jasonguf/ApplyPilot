@@ -4,7 +4,7 @@ Interactive flow that creates ~/.applypilot/ with:
   - resume.txt (and optionally resume.pdf)
   - profile.json
   - searches.yaml
-  - .env (optional runtime settings such as CapSolver)
+  - .env (optional local runtime settings)
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from rich.prompt import Confirm, Prompt
 
 from applypilot.config import (
     APP_DIR,
-    ENV_PATH,
     PROFILE_PATH,
     RESUME_PATH,
     RESUME_PDF_PATH,
@@ -101,7 +100,6 @@ def _setup_profile() -> dict:
         "github_url": Prompt.ask("GitHub URL (optional)", default=""),
         "portfolio_url": Prompt.ask("Portfolio URL (optional)", default=""),
         "website_url": Prompt.ask("Personal website URL (optional)", default=""),
-        "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
     }
 
     # -- Work Authorization --
@@ -296,44 +294,31 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Explain the browser requirements for application assistance."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "using Codex App Server with your connected ChatGPT plan."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
-    if shutil.which("claude"):
-        console.print("[green]Claude Code CLI detected.[/green]")
+    # Check for Codex CLI
+    if shutil.which("codex"):
+        console.print("[green]Codex CLI detected.[/green]")
     else:
         console.print(
-            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "[yellow]Codex CLI not found on PATH.[/yellow]\n"
+            "Install Codex CLI and make `codex` available on PATH before running auto-apply."
         )
 
-    # Optional: CapSolver for CAPTCHAs
-    console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
-    if Confirm.ask("Configure CapSolver API key? (optional)", default=False):
-        capsolver_key = Prompt.ask("CapSolver API key")
-        # Append to existing .env or create
-        if ENV_PATH.exists():
-            existing = ENV_PATH.read_text(encoding="utf-8")
-            if "CAPSOLVER_API_KEY" not in existing:
-                ENV_PATH.write_text(
-                    existing.rstrip() + f"\nCAPSOLVER_API_KEY={capsolver_key}\n",
-                    encoding="utf-8",
-                )
-        else:
-            ENV_PATH.write_text(f"# ApplyPilot configuration\nCAPSOLVER_API_KEY={capsolver_key}\n", encoding="utf-8")
-        console.print("[green]CapSolver key saved.[/green]")
-    else:
-        console.print("[dim]Skipped. Add CAPSOLVER_API_KEY to .env later if needed.[/dim]")
+    console.print(
+        "\n[dim]Auto-apply also needs your ChatGPT plan sign-in, Chrome, and Node.js/npx. "
+        "Run `applypilot browser setup` to sign into employer sites in ApplyPilot's separate Chrome profile. "
+        "Review uncertain outcomes manually before retrying.[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +357,7 @@ def run_wizard() -> None:
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 5: Auto-apply (Codex detection)
     _setup_auto_apply()
     console.print()
 
@@ -394,9 +379,9 @@ def run_wizard() -> None:
 
     unlock_hint = ""
     if tier == 1:
-        unlock_hint = "\n[dim]To unlock Tier 2: connect a ChatGPT account with [bold]applypilot auth login[/bold].[/dim]"
+        unlock_hint = "\n[dim]ChatGPT sign-in unlocks AI stages and Codex browser automation.[/dim]"
     elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+        unlock_hint = "\n[dim]Install Codex CLI, Chrome, and Node.js to enable browser application automation.[/dim]"
 
     console.print(
         Panel.fit(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 from typing import Optional
 
@@ -27,6 +26,10 @@ app = typer.Typer(
 )
 auth_app = typer.Typer(name="auth", help="Manage ChatGPT plan sign-in and models.", no_args_is_help=True)
 app.add_typer(auth_app, name="auth")
+browser_app = typer.Typer(name="browser", help="Manage the isolated ApplyPilot Chrome profile.", no_args_is_help=True)
+app.add_typer(browser_app, name="browser")
+profile_app = typer.Typer(name="profile", help="Manage applicant profile data.", no_args_is_help=True)
+app.add_typer(profile_app, name="profile")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -76,6 +79,36 @@ def init() -> None:
     from applypilot.wizard.init import run_wizard
 
     run_wizard()
+
+
+@profile_app.command("clear-job-password")
+def profile_clear_job_password() -> None:
+    """Remove an older saved job-site password from profile.json."""
+    import json
+    from applypilot.config import PROFILE_PATH
+
+    if not PROFILE_PATH.is_file():
+        console.print("[yellow]No profile.json found.[/yellow]")
+        raise typer.Exit(code=1)
+    try:
+        profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]Could not read profile.json:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    personal = profile.get("personal")
+    if not isinstance(personal, dict) or "password" not in personal:
+        console.print("No saved job-site password was present.")
+        return
+    personal.pop("password", None)
+    temporary_path = PROFILE_PATH.with_suffix(".json.tmp")
+    try:
+        temporary_path.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
+        temporary_path.replace(PROFILE_PATH)
+    except OSError as exc:
+        temporary_path.unlink(missing_ok=True)
+        console.print(f"[red]Could not update profile.json:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print("[green]Removed the saved job-site password from profile.json.[/green]")
 
 
 @auth_app.command("login")
@@ -332,8 +365,42 @@ def auth_use_model(model: str = typer.Argument(..., help="Visible model slug fro
 
 
 @auth_app.command("test")
-def auth_test() -> None:
-    """Send one small request through the selected ChatGPT plan route."""
+def auth_test(
+    codex: bool = typer.Option(
+        False, "--codex",
+        help="Send one small request through Codex App Server; uses shared ChatGPT plan usage and opens no browser.",
+    ),
+) -> None:
+    """Test the selected ChatGPT plan route, optionally through Codex App Server."""
+    if codex:
+        import shutil
+        from uuid import uuid4
+
+        from applypilot.apply.codex_runtime import resolve_model, run_smoke_request
+        from applypilot.config import APPLY_RUN_DIR, ensure_dirs
+        from applypilot.llm_errors import ChatGPTAuthError
+        from applypilot.siwc import ChatGPTAuth
+
+        ensure_dirs()
+        auth = ChatGPTAuth()
+        try:
+            client_id = auth.active_client_id()
+            if not client_id or not auth.has_active_account():
+                raise ChatGPTAuthError("No eligible ChatGPT plan account is active. Run `applypilot auth login`.")
+            token = auth.get_access_token(client_id, min_ttl_seconds=120)
+            model = resolve_model(auth, client_id)
+            run_dir = APPLY_RUN_DIR / f"codex-smoke-{uuid4().hex}"
+            response = run_smoke_request(token, model, run_dir)
+        except Exception as exc:
+            console.print(f"[red]Codex App Server self-test failed:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        finally:
+            if "run_dir" in locals() and run_dir.exists():
+                shutil.rmtree(run_dir, ignore_errors=True)
+        console.print(f"[green]Codex App Server completed with {model}:[/green] {response}")
+        console.print("No browser was launched and no employer site was contacted.")
+        return
+
     from applypilot.llm import get_client
     from applypilot.llm_errors import LLMError
 
@@ -349,6 +416,45 @@ def auth_test() -> None:
         raise typer.Exit(code=1) from exc
     console.print(f"[green]Completed with {client.model}:[/green] {response}")
     console.print(f"Requests this process: {client.request_count}")
+
+
+@browser_app.command("setup")
+def browser_setup() -> None:
+    """Open the isolated ApplyPilot Chrome profile for manual employer sign-in."""
+    import sys
+
+    from filelock import FileLock, Timeout
+    from applypilot.config import APP_DIR, ensure_dirs
+    from applypilot.apply.chrome import (
+        BASE_CDP_PORT, cleanup_worker, launch_chrome,
+        setup_worker_profile,
+    )
+
+    if not sys.stdin.isatty():
+        console.print("[red]Run `applypilot browser setup` from an interactive terminal.[/red]")
+        raise typer.Exit(code=2)
+    ensure_dirs()
+    profile_dir = setup_worker_profile(0)
+    lock = FileLock(str(APP_DIR / "apply.lock"))
+    try:
+        lock.acquire(timeout=0)
+    except Timeout as exc:
+        console.print("[red]Another ApplyPilot browser/apply run is active.[/red]")
+        raise typer.Exit(code=1) from exc
+    chrome = None
+    try:
+        chrome = launch_chrome(0, port=BASE_CDP_PORT, headless=False)
+        console.print(f"[green]ApplyPilot Chrome profile opened:[/green] {profile_dir}")
+        console.print("Sign into employer sites yourself in this window. Do not enter passwords in the ApplyPilot prompt.")
+        console.print("This command does not start Codex, contact OpenAI, or navigate to an employer site.")
+        Prompt.ask("Press Enter here when you are done; the browser will close and keep its profile cookies")
+    except (OSError, RuntimeError) as exc:
+        console.print(f"[red]Could not open the ApplyPilot Chrome profile:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if chrome is not None:
+            cleanup_worker(0, chrome)
+        lock.release()
 
 
 @auth_app.command("logout")
@@ -460,38 +566,108 @@ def run(
 
 @app.command()
 def apply(
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
-    continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Maximum jobs to process (default: 1)."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Browser/model workers (currently limited to 1)."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score in tailored mode (default: 7)."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Visible ChatGPT model slug; defaults to the active account selection."),
+    resume_mode: str = typer.Option("base", "--resume-mode", help="Resume mode: base or tailored."),
+    max_age_days: int = typer.Option(30, "--max-age-days", help="Exclude postings older than this when their posting date is known."),
+    continuous: bool = typer.Option(False, "--continuous", "-c", help="Run continuously, polling for new jobs."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Browser rehearsal only; may autosave form data on employer sites."),
+    preview: bool = typer.Option(False, "--preview", help="Show eligible jobs locally without launching a browser or contacting AI."),
+    preview_limit: int = typer.Option(25, "--preview-limit", help="Maximum candidates shown by --preview."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm outbound browser automation without an interactive prompt."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
-    url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
-    gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
+    url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific exact job URL."),
+    gen: bool = typer.Option(False, "--gen", help="Write a local prompt file for manual inspection."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
-    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
+    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
-    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset only failed jobs for retry."),
+    reset_previewed: bool = typer.Option(False, "--reset-previewed", help="Requeue browser rehearsals after manual review."),
+    review: bool = typer.Option(False, "--review", help="List application outcomes that need manual review."),
+    resume_waiting: bool = typer.Option(False, "--resume", help="Resume one saved employer login/signup handoff interactively."),
 ) -> None:
-    """Launch auto-apply to submit job applications."""
+    """Apply with the unchanged base resume by default; tailored mode is optional."""
     _bootstrap()
+    import sys
+    from uuid import uuid4
 
-    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
-    from applypilot.database import get_connection
+    from applypilot.config import DEFAULTS, PROFILE_PATH
+    from applypilot.apply.launcher import list_ready_jobs
 
-    # --- Utility modes (no Chrome/Claude needed) ---
+    mode = resume_mode.strip().casefold()
+    if mode not in {"base", "tailored"}:
+        console.print("[red]--resume-mode must be either 'base' or 'tailored'.[/red]")
+        raise typer.Exit(code=2)
+    if (workers < 1 or workers > DEFAULTS["max_apply_workers"]
+            or max_age_days < 0 or preview_limit < 1
+            or (limit is not None and not continuous and
+                (limit < 1 or limit > DEFAULTS["max_apply_batch"]))):
+        console.print(
+            f"[red]Use 1-{DEFAULTS['max_apply_workers']} workers, a batch limit of "
+            f"1-{DEFAULTS['max_apply_batch']}, a positive preview limit, and a nonnegative max age.[/red]"
+        )
+        raise typer.Exit(code=2)
+    if min_score is not None and not 0 <= min_score <= 10:
+        console.print("[red]--min-score must be between 0 and 10.[/red]")
+        raise typer.Exit(code=2)
 
-    if mark_applied:
-        from applypilot.apply.launcher import mark_job
-        mark_job(mark_applied, "applied")
-        console.print(f"[green]Marked as applied:[/green] {mark_applied}")
+    utility_modes = sum(bool(value) for value in (mark_applied, mark_failed, reset_failed, reset_previewed, review, resume_waiting))
+    if utility_modes > 1 or (utility_modes and (preview or gen or url or dry_run)):
+        console.print("[red]Choose only one apply utility mode at a time.[/red]")
+        raise typer.Exit(code=2)
+
+    if resume_waiting:
+        if continuous or headless or yes or limit is not None or model is not None:
+            console.print("[red]--resume is interactive and cannot be combined with --continuous, --headless, --yes, --limit, or --model.[/red]")
+            raise typer.Exit(code=2)
+        if not sys.stdin.isatty():
+            console.print("[red]--resume requires an interactive terminal because you must complete employer login/signup yourself.[/red]")
+            raise typer.Exit(code=2)
+        from applypilot.apply.launcher import list_waiting_jobs, resume_waiting_job
+        try:
+            waiting_jobs = list_waiting_jobs()
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        if not waiting_jobs:
+            console.print("No saved employer handoffs are waiting. Run `applypilot apply --review` to inspect other outcomes.")
+            return
+        table = Table(title="Saved Employer Handoffs", header_style="bold yellow")
+        table.add_column("#", justify="right")
+        table.add_column("Job")
+        table.add_column("Company/source")
+        table.add_column("Location")
+        table.add_column("Requisition")
+        table.add_column("Reason")
+        for index, job in enumerate(waiting_jobs, start=1):
+            table.add_row(str(index), job.get("title") or "Unknown",
+                          job.get("company") or job.get("site") or "Unknown",
+                          job.get("location") or "Unknown",
+                          job.get("requisition_id") or "—",
+                          job.get("apply_error") or "login/signup required")
+        console.print(table)
+        selection = Prompt.ask("Choose one handoff number (or q to cancel)",
+                               choices=[str(i) for i in range(1, len(waiting_jobs) + 1)] + ["q"],
+                               default="q")
+        if selection == "q":
+            return
+        try:
+            resume_waiting_job(waiting_jobs[int(selection) - 1]["url"])
+        except (RuntimeError, OSError, ValueError, ImportError) as exc:
+            console.print(f"[red]Could not resume this handoff:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
         return
 
-    if mark_failed:
+    if mark_applied or mark_failed:
         from applypilot.apply.launcher import mark_job
-        mark_job(mark_failed, "failed", reason=fail_reason)
-        console.print(f"[yellow]Marked as failed:[/yellow] {mark_failed} ({fail_reason or 'manual'})")
+        try:
+            mark_job(mark_applied or mark_failed, "applied" if mark_applied else "failed", reason=fail_reason)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        console.print(f"[green]Updated job status:[/green] {mark_applied or mark_failed}")
         return
 
     if reset_failed:
@@ -500,77 +676,185 @@ def apply(
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
         return
 
-    # --- Full apply mode ---
+    if reset_previewed:
+        from applypilot.apply.launcher import reset_previewed as do_reset_previewed
+        count = do_reset_previewed()
+        console.print(f"[green]Requeued {count} browser-rehearsed job(s).[/green]")
+        return
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
-    check_tier(3, "auto-apply")
+    if review:
+        from applypilot.database import get_connection
+        rows = get_connection().execute("""
+            SELECT title, company, site, apply_status, apply_error,
+                   COALESCE(application_url, url) AS review_url, last_attempted_at
+            FROM jobs
+            WHERE apply_status IN ('needs_review', 'awaiting_user', 'uncertain', 'previewed', 'manual', 'captcha', 'expired', 'failed')
+            ORDER BY last_attempted_at DESC, title
+            LIMIT 100
+        """).fetchall()
+        if not rows:
+            console.print("No application outcomes need review.")
+            return
+        table = Table(title="Application Outcomes for Manual Review", header_style="bold yellow")
+        table.add_column("Status")
+        table.add_column("Job")
+        table.add_column("Company/source")
+        table.add_column("Reason")
+        table.add_column("Application URL", overflow="fold")
+        for row in rows:
+            table.add_row(row["apply_status"], row["title"] or "Unknown", row["company"] or row["site"] or "Unknown",
+                          row["apply_error"] or "", row["review_url"] or "")
+        console.print(table)
+        console.print("Use `applypilot apply --resume` for awaiting-user handoffs. After checking other outcomes, resolve with --mark-applied URL or --mark-failed URL.")
+        return
 
-    # Check 2: Profile exists
-    if not _profile_path.exists():
-        console.print(
-            "[red]Profile not found.[/red]\n"
-            "Run [bold]applypilot init[/bold] to create your profile first."
-        )
+    if not PROFILE_PATH.is_file():
+        console.print("[red]Profile not found.[/red] Run applypilot init first.")
         raise typer.Exit(code=1)
+    from applypilot.config import load_profile
+    try:
+        profile_data = load_profile()
+        personal = profile_data.get("personal", {})
+        if (not isinstance(personal, dict) or not personal.get("full_name")
+                or not personal.get("email")
+                or not isinstance(profile_data.get("work_authorization"), dict)
+                or not isinstance(profile_data.get("compensation"), dict)):
+            raise ValueError("profile.json needs personal name/email, work_authorization, and compensation sections")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        console.print(f"[red]Profile is not ready for apply:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
-    if not (gen and url):
-        conn = get_connection()
-        ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
-        ).fetchone()[0]
-        if ready == 0:
-            console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
+    if preview and (gen or dry_run or url):
+        console.print("[red]--preview is local-only and cannot be combined with --gen, --dry-run, or --url.[/red]")
+        raise typer.Exit(code=2)
+    if gen and not url:
+        console.print("[red]--gen requires --url to specify one job.[/red]")
+        raise typer.Exit(code=2)
+    if continuous and url:
+        console.print("[red]--url cannot be combined with --continuous.[/red]")
+        raise typer.Exit(code=2)
+
+    effective_min_score = (7 if min_score is None else min_score) if mode == "tailored" else None
+
+    if preview:
+        from applypilot.apply.resume import prepare_base_resume_snapshot
+        from applypilot.config import APPLY_RUN_DIR
+        run_dir = APPLY_RUN_DIR / f"preview-{uuid4().hex}"
+        try:
+            snapshot = prepare_base_resume_snapshot(run_dir) if mode == "base" else None
+            candidates = list_ready_jobs(
+                min_score=effective_min_score, resume_mode=mode,
+                limit=preview_limit, max_age_days=max_age_days,
             )
+            console.print(f"[bold]Local apply preview ({mode} resume)[/bold]")
+            if snapshot:
+                console.print(f"Resume SHA-256: {snapshot.sha256}")
+            console.print(f"Candidates shown: {len(candidates)} (maximum {preview_limit})")
+            if candidates:
+                table = Table(title="Eligible Jobs", header_style="bold cyan")
+                for heading in ("Title", "Company/source", "Location", "Posted", "Score", "Review"):
+                    table.add_column(heading)
+                for job in candidates:
+                    table.add_row(
+                        (job.get("title") or "Unknown")[:50],
+                        (job.get("company") or job.get("site") or "Unknown")[:28],
+                        (job.get("location") or "Unknown")[:30],
+                        job.get("posted_at") or "unknown",
+                        str(job.get("fit_score") if job.get("fit_score") is not None else "not scored"),
+                        job.get("duplicate_review") or "",
+                    )
+                console.print(table)
+            else:
+                console.print("[yellow]No eligible jobs matched the queue filters.[/yellow]")
+            console.print("No browser was launched and no external service was contacted.")
+        except (OSError, ValueError, ImportError) as exc:
+            console.print(f"[red]Preview could not be prepared:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        finally:
+            if run_dir.exists():
+                import shutil
+                shutil.rmtree(run_dir, ignore_errors=True)
+        return
+
+    if mode == "tailored" and not (gen and url):
+        ready = list_ready_jobs(min_score=effective_min_score, resume_mode="tailored",
+                                limit=1, max_age_days=max_age_days)
+        if not ready:
+            console.print("[red]No tailored resumes are ready.[/red] Run applypilot run score tailor first.")
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
-        target = url or ""
-        if not target:
-            console.print("[red]--gen requires --url to specify which job.[/red]")
-            raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        from applypilot.apply.launcher import gen_prompt
+        try:
+            prompt_file = gen_prompt(
+                url, min_score=effective_min_score or 0,
+                resume_mode=mode, max_age_days=max_age_days,
+            )
+        except (OSError, ValueError, ImportError) as exc:
+            console.print(f"[red]Could not generate the prompt:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
         if not prompt_file:
-            console.print("[red]No matching job found for that URL.[/red]")
+            console.print("[red]No matching eligible job was found.[/red]")
             raise typer.Exit(code=1)
-        mcp_path = _profile_path.parent / ".mcp-apply-0.json"
-        console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
-        console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
-        )
+        console.print(f"[green]Wrote local prompt containing personal data to:[/green] {prompt_file}")
+        console.print("This file is for local inspection only; it is not a runnable browser-agent command.")
         return
 
-    from applypilot.apply.launcher import main as apply_main
+    candidates = list_ready_jobs(
+        target_url=url, min_score=effective_min_score, resume_mode=mode,
+        limit=1000, max_age_days=max_age_days,
+    )
+    if not candidates and not continuous:
+        console.print("[red]No eligible jobs matched the selected resume mode and queue filters.[/red]")
+        raise typer.Exit(code=1)
+
+    from applypilot.config import check_auto_apply_dependencies
+    check_auto_apply_dependencies()
+    if mode == "base":
+        from applypilot.apply.resume import prepare_base_resume_snapshot
+        from applypilot.config import APPLY_RUN_DIR
+        preflight_dir = APPLY_RUN_DIR / f"preflight-{uuid4().hex}"
+        try:
+            snapshot = prepare_base_resume_snapshot(preflight_dir)
+            console.print(f"Base resume SHA-256: {snapshot.sha256}")
+        except (OSError, ValueError, ImportError) as exc:
+            console.print(f"[red]Base resume is not ready:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        finally:
+            if preflight_dir.exists():
+                import shutil
+                shutil.rmtree(preflight_dir, ignore_errors=True)
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
-
-    console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
-    console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
-    console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
-    console.print(f"  Headless: {headless}")
-    console.print(f"  Dry run:  {dry_run}")
-    if url:
-        console.print(f"  Target:   {url}")
-    console.print()
-
-    apply_main(
-        limit=effective_limit,
-        target_url=url,
-        min_score=min_score,
-        headless=headless,
-        model=model,
-        dry_run=dry_run,
-        continuous=continuous,
-        workers=workers,
+    if not continuous and effective_limit < 1:
+        console.print("[red]--limit must be at least 1 unless --continuous is used.[/red]")
+        raise typer.Exit(code=2)
+    jobs_in_scope = "unlimited as eligible jobs arrive" if continuous else str(min(effective_limit, len(candidates)))
+    action = "rehearse in browser" if dry_run else "send applications"
+    console.print(
+        f"This will {action} for {jobs_in_scope} job(s), using the {mode} resume. "
+        "ApplyPilot sends your profile, resume, and job details to OpenAI through the active ChatGPT plan, "
+        "then uses an isolated Chrome profile to visit the selected employer sites. ChatGPT plan usage is "
+        "shared with other apps on your account. The pinned Playwright MCP package may be downloaded from npm. "
+        "Employer pages may autosave form data."
     )
+    if not yes:
+        if not sys.stdin.isatty():
+            console.print("[red]Use --yes for an unattended run after reviewing applypilot apply --preview.[/red]")
+            raise typer.Exit(code=2)
+        if not Confirm.ask("Start browser automation now?", default=False):
+            raise typer.Exit()
 
+    from applypilot.apply.launcher import main as apply_main
+    try:
+        apply_main(
+            limit=effective_limit, target_url=url, min_score=effective_min_score,
+            headless=headless, model=model, dry_run=dry_run, continuous=continuous,
+            workers=workers, resume_mode=mode, max_age_days=max_age_days,
+        )
+    except (RuntimeError, OSError, ValueError, ImportError) as exc:
+        console.print(f"[red]Apply run could not start:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 @app.command()
 def status() -> None:
@@ -597,9 +881,13 @@ def status() -> None:
     summary.add_row("Tailored resumes", str(stats["tailored"]))
     summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
     summary.add_row("Cover letters", str(stats["with_cover_letter"]))
-    summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
+    summary.add_row("Potential base-resume candidates", str(stats["ready_to_apply_base"]))
+    summary.add_row("Potential tailored-resume candidates", str(stats["ready_to_apply_tailored"]))
     summary.add_row("Applied", str(stats["applied"]))
     summary.add_row("Apply errors", str(stats["apply_errors"]))
+    summary.add_row("Needs review", str(stats["needs_review"]))
+    summary.add_row("Awaiting you", str(stats["awaiting_user"]))
+    summary.add_row("Uncertain outcome", str(stats["uncertain"]))
 
     console.print(summary)
 
@@ -651,10 +939,12 @@ def dashboard() -> None:
 @app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
+    import re
     import shutil
+    import subprocess
     from applypilot.config import (
-        load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        load_env, load_profile, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
+        SEARCH_CONFIG_PATH, get_chrome_path,
     )
 
     load_env()
@@ -669,6 +959,13 @@ def doctor() -> None:
     # Profile
     if PROFILE_PATH.exists():
         results.append(("profile.json", ok_mark, str(PROFILE_PATH)))
+        try:
+            saved_profile = load_profile()
+            if saved_profile.get("personal", {}).get("password"):
+                results.append(("Saved job-site password", warn_mark,
+                                "Not used for applications; remove it with 'applypilot profile clear-job-password'"))
+        except Exception as exc:
+            results.append(("profile.json contents", fail_mark, str(exc)))
     else:
         results.append(("profile.json", fail_mark, "Run 'applypilot init' to create"))
 
@@ -694,7 +991,7 @@ def doctor() -> None:
         results.append(("python-jobspy", warn_mark,
                         "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex"))
 
-    # --- Tier 2 checks ---
+    # --- ChatGPT plan check for AI stages and the Codex browser agent ---
     from applypilot.siwc import ChatGPTAuth
     try:
         chatgpt_account = ChatGPTAuth().active_account()
@@ -707,18 +1004,17 @@ def doctor() -> None:
                             "Plan permission or secure session unavailable — run 'applypilot auth login'"))
         else:
             results.append(("ChatGPT plan", fail_mark,
-                            "Connect your ChatGPT account — run 'applypilot auth login'"))
+                            "Needed for the Codex browser agent and AI stages — run 'applypilot auth login'"))
     except Exception as exc:
         results.append(("ChatGPT plan", fail_mark, f"Account settings unavailable: {exc}"))
 
-    # --- Tier 3 checks ---
-    # Claude Code CLI
-    claude_bin = shutil.which("claude")
-    if claude_bin:
-        results.append(("Claude Code CLI", ok_mark, claude_bin))
+    # --- Browser-application requirements ---
+    codex_bin = shutil.which("codex")
+    if codex_bin:
+        results.append(("Codex CLI", ok_mark, codex_bin))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("Codex CLI", fail_mark,
+                        "Install Codex and make `codex` available on PATH (needed for auto-apply)"))
 
     # Chrome
     try:
@@ -728,21 +1024,48 @@ def doctor() -> None:
         results.append(("Chrome/Chromium", fail_mark,
                         "Install Chrome or set CHROME_PATH env var (needed for auto-apply)"))
 
-    # Node.js / npx (for Playwright MCP)
+    # Node.js / npx (for the pinned Playwright MCP package)
     npx_bin = shutil.which("npx")
-    if npx_bin:
-        results.append(("Node.js (npx)", ok_mark, npx_bin))
+    node_bin = shutil.which("node")
+    if npx_bin and node_bin:
+        try:
+            node_version = subprocess.run(
+                [node_bin, "--version"], capture_output=True, text=True, timeout=5, check=True,
+            ).stdout.strip()
+            version_match = re.match(r"v?(\d+)", node_version)
+            if version_match and int(version_match.group(1)) >= 18:
+                results.append(("Node.js / npx", ok_mark, f"{node_version}; {npx_bin}"))
+            else:
+                results.append(("Node.js / npx", fail_mark, f"Node.js 18+ required; found {node_version or 'unknown'}"))
+        except (OSError, subprocess.SubprocessError):
+            results.append(("Node.js / npx", fail_mark, "Could not verify Node.js 18 or newer"))
+    elif npx_bin:
+        results.append(("Node.js / npx", fail_mark, "Node.js 18+ executable not found on PATH"))
     else:
-        results.append(("Node.js (npx)", fail_mark,
+        results.append(("Node.js / npx", fail_mark,
                         "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
 
-    # CapSolver (optional)
-    capsolver = os.environ.get("CAPSOLVER_API_KEY")
-    if capsolver:
-        results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
-    else:
-        results.append(("CapSolver API key", "[dim]optional[/dim]",
-                        "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+    if codex_bin and npx_bin and node_bin:
+        try:
+            from applypilot.apply.codex_runtime import validate_runtime_paths
+            validate_runtime_paths()
+            results.append(("Codex / npx launch paths", ok_mark, "App Server and Playwright MCP entry points found"))
+        except Exception as exc:
+            results.append(("Codex / npx launch paths", fail_mark, str(exc)))
+
+    try:
+        import pypdf  # noqa: F401
+        if RESUME_PDF_PATH.exists():
+            from applypilot.apply.resume import _extract_pdf_text
+            try:
+                _extract_pdf_text(RESUME_PDF_PATH)
+                results.append(("Base resume PDF", ok_mark, "PDF text extraction is available"))
+            except ValueError as exc:
+                results.append(("Base resume PDF", fail_mark, str(exc)))
+        elif RESUME_PATH.exists():
+            results.append(("Base resume", ok_mark, "Text source found; PDF is generated for each apply run"))
+    except ImportError:
+        results.append(("pypdf", fail_mark, "Install the project dependencies to validate resume PDFs"))
 
     # --- Render results ---
     console.print()
@@ -761,10 +1084,9 @@ def doctor() -> None:
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
     if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (run 'applypilot auth login')[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → ChatGPT sign-in unlocks AI stages and the Codex browser agent.[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Browser automation also needs Codex CLI + Chrome + Node.js.[/dim]")
 
     console.print()
 

@@ -24,7 +24,7 @@ class WorkerState:
     """Tracks the current state of the apply worker."""
 
     worker_id: int = 0
-    status: str = "starting"  # starting, applying, applied, failed, expired, captcha, idle, done
+    status: str = "starting"  # starting, applying, awaiting_user, applied, failed, expired, captcha, idle, done
     job_title: str = ""
     company: str = ""
     score: int = 0
@@ -97,6 +97,7 @@ _STATUS_STYLES: dict[str, str] = {
     "starting": "dim",
     "idle": "dim",
     "applying": "yellow",
+    "awaiting_user": "bold yellow",
     "applied": "bold green",
     "failed": "red",
     "expired": "dim red",
@@ -121,7 +122,7 @@ def render_dashboard() -> Table:
     table.add_column("Last Action", min_width=20, max_width=35, no_wrap=True)
     table.add_column("OK", width=4, justify="right", style="green")
     table.add_column("Fail", width=4, justify="right", style="red")
-    table.add_column("Cost", width=8, justify="right")
+    table.add_column("API cost", width=8, justify="right")
 
     with _lock:
         states = sorted(_worker_states.values(), key=lambda s: s.worker_id)
@@ -159,7 +160,7 @@ def render_dashboard() -> Table:
     table.add_section()
     table.add_row(
         "", "", "", "", "", "TOTAL",
-        str(total_applied), str(total_failed), f"${total_cost:.3f}",
+        str(total_applied), str(total_failed), f"${total_cost:.3f}" if total_cost else "—",
         style="bold",
     )
 
