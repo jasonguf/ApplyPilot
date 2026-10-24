@@ -1,41 +1,32 @@
-"""Chrome lifecycle management for apply workers.
+"""Chrome lifecycle management for isolated ApplyPilot browser workers."""
 
-Handles launching an isolated Chrome instance with remote debugging,
-worker profile setup/cloning, and cross-platform process cleanup.
-"""
+from __future__ import annotations
 
 import json
 import logging
+import os
 import platform
 import shutil
+import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from applypilot import config
 
 logger = logging.getLogger(__name__)
 
-# CDP port base — each worker uses BASE_CDP_PORT + worker_id
 BASE_CDP_PORT = 9222
-
-# Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------------------
-# Cross-platform process helpers
-# ---------------------------------------------------------------------------
-
 def _kill_process_tree(pid: int) -> None:
-    """Kill a process and all its children.
-
-    On Windows, Chrome spawns 10+ child processes (GPU, renderer, etc.),
-    so taskkill /T is needed to kill the entire tree. On Unix, os.killpg
-    handles the process group.
-    """
+    """Kill a process tree rooted at a process ApplyPilot launched."""
     import signal as _signal
 
     try:
@@ -47,178 +38,109 @@ def _kill_process_tree(pid: int) -> None:
                 timeout=10,
             )
         else:
-            # Unix: kill entire process group
             import os
             try:
                 os.killpg(os.getpgid(pid), _signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
-                # Process already gone or owned by another user
                 try:
                     os.kill(pid, _signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
     except Exception:
-        logger.debug("Failed to kill process tree for PID %d", pid, exc_info=True)
+        logger.debug("Failed to stop owned process tree (pid %d)", pid, exc_info=True)
 
 
-def _kill_on_port(port: int) -> None:
-    """Kill any process listening on a specific port (zombie cleanup).
-
-    Uses netstat on Windows, lsof on macOS/Linux.
-    """
+def _assert_port_available(port: int) -> None:
+    """Fail if a port is occupied; never terminate an unrelated listener."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        if platform.system() == "Windows":
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for line in result.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    if pid.isdigit():
-                        _kill_process_tree(int(pid))
-        else:
-            # macOS / Linux
-            result = subprocess.run(
-                ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for pid_str in result.stdout.strip().splitlines():
-                pid_str = pid_str.strip()
-                if pid_str.isdigit():
-                    _kill_process_tree(int(pid_str))
-    except FileNotFoundError:
-        logger.debug("Port-kill tool not found (netstat/lsof) for port %d", port)
-    except Exception:
-        logger.debug("Failed to kill process on port %d", port, exc_info=True)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        raise RuntimeError(
+            f"Chrome debugging port {port} is already in use. Close the process using it and retry."
+        ) from exc
+    finally:
+        probe.close()
 
-
-# ---------------------------------------------------------------------------
-# Worker profile management
-# ---------------------------------------------------------------------------
 
 def setup_worker_profile(worker_id: int) -> Path:
-    """Create an isolated Chrome profile for a worker.
-
-    On first run, clones from an existing worker profile (preferred, since
-    it already has session cookies) or from the user's real Chrome profile.
-    Subsequent runs reuse the existing worker profile.
-
-    Args:
-        worker_id: Numeric worker identifier.
-
-    Returns:
-        Path to the worker's Chrome user-data directory.
-    """
-    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
-    if (profile_dir / "Default").exists():
-        return profile_dir  # Already initialized
-
-    # Find a source: prefer existing worker (has session cookies), else user profile
-    source: Path | None = None
-    for wid in range(10):
-        if wid == worker_id:
-            continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
-            source = candidate
-            break
-    if source is None:
-        source = config.get_chrome_user_data()
-
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
+    """Create or reuse an ApplyPilot-only Chrome profile for this worker."""
+    # Versioned path intentionally avoids reusing profiles cloned by older releases.
+    profile_dir = config.CHROME_WORKER_DIR / "codex-isolated-v1" / f"worker-{worker_id}"
     profile_dir.mkdir(parents=True, exist_ok=True)
-
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
-    }
-
-    for item in source.iterdir():
-        if item.name in skip:
-            continue
-        dst = profile_dir / item.name
-        try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
-
+    if os.name != "nt":
+        for directory in (config.CHROME_WORKER_DIR, profile_dir.parent, profile_dir):
+            os.chmod(directory, 0o700)
     return profile_dir
 
 
 def _suppress_restore_nag(profile_dir: Path) -> None:
-    """Clear Chrome's 'restore pages' nag by fixing Preferences.
-
-    Chrome writes exit_type=Crashed when killed, which triggers a
-    'Restore pages?' prompt on next launch. This patches it out.
-    """
+    """Clear Chrome's restore prompt inside the isolated ApplyPilot profile."""
     prefs_file = profile_dir / "Default" / "Preferences"
     if not prefs_file.exists():
         return
-
     try:
         prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
         prefs.setdefault("profile", {})["exit_type"] = "Normal"
-        prefs.setdefault("session", {})["restore_on_startup"] = 4  # 4 = open blank
+        prefs.setdefault("session", {})["restore_on_startup"] = 4
         prefs.setdefault("session", {}).pop("startup_urls", None)
         prefs["credentials_enable_service"] = False
         prefs.setdefault("password_manager", {})["saving_enabled"] = False
         prefs.setdefault("autofill", {})["profile_enabled"] = False
         prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
     except Exception:
-        logger.debug("Could not patch Chrome preferences", exc_info=True)
+        logger.debug("Could not patch isolated Chrome preferences", exc_info=True)
 
 
-# ---------------------------------------------------------------------------
-# Chrome launch / kill
-# ---------------------------------------------------------------------------
+def _wait_for_cdp(proc: subprocess.Popen, port: int, timeout: float = 20.0) -> None:
+    endpoint = f"http://127.0.0.1:{port}/json/version"
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Chrome exited during startup (exit {proc.returncode}).")
+        try:
+            with urllib.request.urlopen(endpoint, timeout=1) as response:
+                payload = json.loads(response.read(16_384).decode("utf-8"))
+            if isinstance(payload, dict) and payload.get("Browser") and payload.get("webSocketDebuggerUrl"):
+                return
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            last_error = exc
+        time.sleep(0.2)
+    detail = f" ({type(last_error).__name__})" if last_error else ""
+    raise RuntimeError(f"Chrome did not expose its local debugging endpoint in time{detail}.")
+
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
-    """Launch a Chrome instance with remote debugging for a worker.
-
-    Args:
-        worker_id: Numeric worker identifier.
-        port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
-        headless: Run Chrome in headless mode (no visible window).
-
-    Returns:
-        subprocess.Popen handle for the Chrome process.
-    """
+                  headless: bool = False,
+                  startup_url: str | None = None) -> subprocess.Popen:
+    """Launch Chrome in its dedicated profile and wait for its local CDP endpoint."""
+    if startup_url:
+        try:
+            parsed = urlsplit(startup_url)
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("Chrome startup URL has an invalid port.") from exc
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username or parsed.password):
+            raise ValueError("Chrome startup URL must be a valid HTTP(S) URL without credentials.")
     if port is None:
         port = BASE_CDP_PORT + worker_id
-
+    _assert_port_available(port)
     profile_dir = setup_worker_profile(worker_id)
-
-    # Kill any zombie Chrome from a previous run on this port
-    _kill_on_port(port)
-
-    # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
-
     chrome_exe = config.get_chrome_path()
-
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
         f"--user-data-dir={profile_dir}",
         "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
-        "--window-size=1024,768",
+        "--window-size=1280,900",
         "--disable-session-crashed-bubble",
         "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
         "--hide-crash-restore-bubble",
@@ -226,7 +148,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--password-store=basic",
         "--disable-save-password-bubble",
         "--disable-popup-blocking",
-        # Block dangerous permissions at browser level
+        "--disable-extensions",
+        "--disable-sync",
+        "--disable-background-networking",
         "--use-fake-device-for-media-stream",
         "--use-fake-ui-for-media-stream",
         "--deny-permission-prompts",
@@ -234,88 +158,61 @@ def launch_chrome(worker_id: int, port: int | None = None,
     ]
     if headless:
         cmd.append("--headless=new")
-
-    # On Unix, start in a new process group so we can kill the whole tree
-    kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if startup_url:
+        cmd.append(startup_url)
+    kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if platform.system() != "Windows":
-        import os
-        kwargs["preexec_fn"] = os.setsid
-
+        kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, **kwargs)
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
-
-    # Give Chrome time to start and open the debug port
-    time.sleep(3)
-    logger.info("[worker-%d] Chrome started on port %d (pid %d)",
-                worker_id, port, proc.pid)
+    try:
+        _wait_for_cdp(proc, port)
+    except Exception:
+        with _chrome_lock:
+            if _chrome_procs.get(worker_id) is proc:
+                _chrome_procs.pop(worker_id, None)
+        if proc.poll() is None:
+            _kill_process_tree(proc.pid)
+        raise
+    logger.info("[worker-%d] Chrome ready on local debugging port %d", worker_id, port)
     return proc
 
 
 def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
-    """Kill a worker's Chrome instance and remove it from tracking.
-
-    Args:
-        worker_id: Numeric worker identifier.
-        process: The Popen handle returned by launch_chrome.
-    """
-    if process and process.poll() is None:
-        _kill_process_tree(process.pid)
+    """Stop only the Chrome process tree tracked for this worker."""
     with _chrome_lock:
-        _chrome_procs.pop(worker_id, None)
-    logger.info("[worker-%d] Chrome cleaned up", worker_id)
+        tracked = _chrome_procs.get(worker_id)
+        if process is not None and tracked is process:
+            _chrome_procs.pop(worker_id, None)
+        else:
+            tracked = None
+    if tracked is not None and tracked.poll() is None:
+        _kill_process_tree(tracked.pid)
+    logger.info("[worker-%d] owned Chrome process cleaned up", worker_id)
 
 
 def kill_all_chrome() -> None:
-    """Kill all Chrome instances and any port zombies.
-
-    Called during graceful shutdown to ensure no orphan Chrome processes.
-    """
+    """Stop every Chrome process launched and tracked by this ApplyPilot process."""
     with _chrome_lock:
-        procs = dict(_chrome_procs)
+        procs = list(_chrome_procs.items())
         _chrome_procs.clear()
-
-    for wid, proc in procs.items():
+    for _worker_id, proc in procs:
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
-
-    # Sweep base port in case of zombies
-    _kill_on_port(BASE_CDP_PORT)
 
 
 def reset_worker_dir(worker_id: int) -> Path:
-    """Wipe and recreate a worker's isolated working directory.
-
-    Each job gets a fresh working directory so that file conflicts
-    (resume PDFs, MCP configs) don't bleed between jobs.
-
-    Args:
-        worker_id: Numeric worker identifier.
-
-    Returns:
-        Path to the clean worker directory.
-    """
+    """Create a clean, per-job working directory with no inherited files."""
     worker_dir = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
     if worker_dir.exists():
-        shutil.rmtree(str(worker_dir), ignore_errors=True)
+        shutil.rmtree(worker_dir)
     worker_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(worker_dir, 0o700)
     return worker_dir
 
 
 def cleanup_on_exit() -> None:
-    """Atexit handler: kill all Chrome processes and sweep CDP ports.
-
-    Register this with atexit.register() at application startup.
-    """
-    with _chrome_lock:
-        procs = dict(_chrome_procs)
-        _chrome_procs.clear()
-
-    for wid, proc in procs.items():
-        if proc.poll() is None:
-            _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
-
-    # Sweep base port for any orphan
-    _kill_on_port(BASE_CDP_PORT)
+    """Atexit handler that stops only processes created by this run."""
+    kill_all_chrome()

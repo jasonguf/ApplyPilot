@@ -672,7 +672,10 @@ class ChatGPTAuth:
             raise ChatGPTAuthError("No models are currently available to this ChatGPT account.")
         return visible
 
-    def get_access_token(self, client_id: str | None = None) -> str:
+    def get_access_token(self, client_id: str | None = None,
+                         min_ttl_seconds: int = 120) -> str:
+        if min_ttl_seconds < 0:
+            raise ValueError("min_ttl_seconds cannot be negative")
         state = _read_state()
         selected_id = client_id or state.get("active_client_id")
         if not selected_id:
@@ -712,7 +715,7 @@ class ChatGPTAuth:
                 access_token = _read_secret(selected_id, generation, "access_token")
                 if not access_token:
                     raise ChatGPTAuthError("The ChatGPT access token is missing. Sign in again.")
-                if float(account.get("expires_at", 0)) > time.time() + 120:
+                if float(account.get("expires_at", 0)) > time.time() + min_ttl_seconds:
                     return access_token
 
                 refresh_token = _read_secret(selected_id, generation, "refresh_token")
@@ -796,6 +799,11 @@ class ChatGPTAuth:
                     raise ChatGPTAuthError(
                         "The renewed session no longer includes the permission for ChatGPT plan inference. "
                         "Run `applypilot auth login --account <client-id>` and approve the requested permission."
+                    )
+                if float(updated["expires_at"]) <= time.time() + min_ttl_seconds:
+                    raise ChatGPTAuthError(
+                        "The renewed ChatGPT token does not remain valid long enough for this browser task. "
+                        "Retry when the account can issue a longer-lived session."
                     )
                 return str(new_access)
         except FileLockTimeout as exc:

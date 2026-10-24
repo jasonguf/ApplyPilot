@@ -2,7 +2,9 @@
 
 import os
 import platform
+import re
 import shutil
+import subprocess
 from pathlib import Path
 
 # User data directory — all user-specific files live here
@@ -24,6 +26,7 @@ LOG_DIR = APP_DIR / "logs"
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
 APPLY_WORKER_DIR = APP_DIR / "apply-workers"
+APPLY_RUN_DIR = APP_DIR / "apply-runs"
 
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
@@ -87,7 +90,7 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR, APPLY_RUN_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -164,11 +167,61 @@ def load_base_urls() -> dict[str, str | None]:
 DEFAULTS = {
     "min_score": 7,
     "max_apply_attempts": 3,
+    "max_apply_batch": 100,
+    "max_apply_workers": 1,
     "max_tailor_attempts": 5,
     "poll_interval": 60,
     "apply_timeout": 300,
+    "apply_domain_cooldown_seconds": 15,
     "viewport": "1280x900",
 }
+
+
+def check_auto_apply_dependencies() -> None:
+    """Check the ChatGPT-backed Codex and local browser requirements."""
+    from rich.console import Console
+
+    missing: list[str] = []
+    if not shutil.which("codex"):
+        missing.append("Codex CLI — install Codex and make `codex` available on PATH")
+    if not shutil.which("npx"):
+        missing.append("Node.js (npx) — install Node.js 18 or newer")
+    node = shutil.which("node")
+    if not node:
+        missing.append("Node.js — install Node.js 18 or newer")
+    else:
+        try:
+            version = subprocess.run(
+                [node, "--version"], capture_output=True, text=True, timeout=5, check=True,
+            ).stdout.strip()
+            match = re.match(r"v?(\d+)", version)
+            if not match or int(match.group(1)) < 18:
+                missing.append(f"Node.js 18 or newer is required (detected {version or 'unknown'})")
+        except (OSError, subprocess.SubprocessError):
+            missing.append("Could not verify Node.js version; install Node.js 18 or newer")
+    try:
+        from applypilot.siwc import ChatGPTAuth
+        if not ChatGPTAuth().has_active_account():
+            missing.append("ChatGPT plan sign-in — run `applypilot auth login`")
+    except Exception:
+        missing.append("ChatGPT plan sign-in — run `applypilot auth login`")
+    try:
+        get_chrome_path()
+    except FileNotFoundError:
+        missing.append("Chrome/Chromium — install it or set CHROME_PATH")
+    if shutil.which("codex") and shutil.which("npx") and shutil.which("node"):
+        try:
+            from applypilot.apply.codex_runtime import validate_runtime_paths
+            validate_runtime_paths()
+        except Exception as exc:
+            missing.append(str(exc))
+
+    if missing:
+        console = Console(stderr=True)
+        console.print("[red]Auto-apply requirements are missing:[/red]")
+        for item in missing:
+            console.print(f"  - {item}")
+        raise SystemExit(1)
 
 
 def load_env():
@@ -186,23 +239,23 @@ def load_env():
 
 TIER_LABELS = {
     1: "Discovery",
-    2: "AI Scoring & Tailoring",
-    3: "Full Auto-Apply",
+    2: "ChatGPT AI Stages",
+    3: "AI Stages and Browser Automation",
 }
 
 TIER_COMMANDS: dict[int, list[str]] = {
     1: ["init", "run discover", "run enrich", "status", "dashboard"],
     2: ["run score", "run tailor", "run cover", "run pdf", "run"],
-    3: ["apply"],
+    3: ["apply --resume-mode base", "apply --resume-mode tailored"],
 }
 
 
 def get_tier() -> int:
     """Detect the current tier based on available dependencies.
 
-    Tier 1 (Discovery):            Python + pip
-    Tier 2 (AI Scoring & Tailoring): + ChatGPT plan sign-in
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 1 (Discovery):             Python + pip
+    Tier 2 (ChatGPT AI stages):    + ChatGPT plan sign-in
+    Tier 3 (AI stages and browser automation): + Codex CLI + Chrome + npx
     """
     load_env()
 
@@ -214,14 +267,23 @@ def get_tier() -> int:
     if not has_llm:
         return 1
 
-    has_claude = shutil.which("claude") is not None
+    has_codex = shutil.which("codex") is not None
+    has_npx = shutil.which("npx") is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    runtime_paths_ok = False
+    if has_codex and has_npx and shutil.which("node"):
+        try:
+            from applypilot.apply.codex_runtime import validate_runtime_paths
+            validate_runtime_paths()
+            runtime_paths_ok = True
+        except Exception:
+            runtime_paths_ok = False
+    if runtime_paths_ok and has_chrome:
         return 3
 
     return 2
@@ -251,8 +313,16 @@ def check_tier(required: int, feature: str) -> None:
         if not has_llm:
             missing.append("ChatGPT plan sign-in — run [bold]applypilot auth login[/bold]")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        if not shutil.which("codex"):
+            missing.append("Codex CLI — install Codex and make `codex` available on PATH")
+        if not shutil.which("npx"):
+            missing.append("Node.js (npx) — install Node.js 18 or newer")
+        elif shutil.which("codex") and shutil.which("node"):
+            try:
+                from applypilot.apply.codex_runtime import validate_runtime_paths
+                validate_runtime_paths()
+            except Exception as exc:
+                missing.append(str(exc))
         try:
             get_chrome_path()
         except FileNotFoundError:
